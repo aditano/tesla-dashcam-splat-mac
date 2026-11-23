@@ -9,7 +9,7 @@ struct ContentView: View {
     var body: some View {
         HStack(spacing: 0) {
             sidebar
-                .frame(width: 360)
+                .frame(width: 380)
             Divider()
             mainPane
         }
@@ -21,7 +21,7 @@ struct ContentView: View {
     }
 
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 14) {
             VStack(alignment: .leading, spacing: 4) {
                 Text("DashSplat")
                     .font(.system(size: 22, weight: .semibold, design: .default))
@@ -33,6 +33,18 @@ struct ContentView: View {
             .padding(.horizontal, 4)
 
             dropZone
+
+            if let warn = model.healthWarning {
+                Text(warn)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color(red: 0.95, green: 0.55, blue: 0.2))
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10)
+                            .fill(Color(red: 0.95, green: 0.55, blue: 0.2).opacity(0.12))
+                    )
+            }
 
             VStack(alignment: .leading, spacing: 8) {
                 Text("EVENTS")
@@ -60,15 +72,50 @@ struct ContentView: View {
                     }
                 }
             }
-            .frame(maxHeight: .infinity)
+            .frame(maxHeight: 220)
+
+            if !model.library.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("RESULTS LIBRARY")
+                        .font(.system(size: 11, weight: .semibold))
+                        .tracking(1.2)
+                        .foregroundStyle(Color(white: 0.55))
+                    ScrollView {
+                        LazyVStack(spacing: 6) {
+                            ForEach(model.library) { item in
+                                LibraryRow(item: item) {
+                                    model.openLibraryItem(item)
+                                }
+                            }
+                        }
+                    }
+                }
+                .frame(maxHeight: 140)
+            }
+
+            Spacer(minLength: 0)
 
             VStack(spacing: 10) {
                 if let progress = model.progress {
                     VStack(alignment: .leading, spacing: 6) {
-                        Text(progress.message)
-                            .font(.system(size: 12))
-                            .foregroundStyle(Color(white: 0.7))
-                            .lineLimit(2)
+                        HStack {
+                            Text(progress.message)
+                                .font(.system(size: 12))
+                                .foregroundStyle(Color(white: 0.7))
+                                .lineLimit(2)
+                            Spacer()
+                            if let eta = progress.etaSec, eta > 0 {
+                                Text(formatETA(eta))
+                                    .font(.system(size: 11, weight: .medium).monospacedDigit())
+                                    .foregroundStyle(Color(white: 0.55))
+                            }
+                        }
+                        if let stage = progress.stage {
+                            Text(stage.uppercased())
+                                .font(.system(size: 10, weight: .semibold))
+                                .tracking(1.0)
+                                .foregroundStyle(Color(white: 0.4))
+                        }
                         ProgressView(value: progress.fraction)
                             .tint(Color(red: 0.24, green: 0.42, blue: 0.88))
                     }
@@ -76,18 +123,32 @@ struct ContentView: View {
 
                 HStack(spacing: 10) {
                     Button {
-                        Task { await model.buildSelected() }
+                        Task { await model.buildPreview() }
                     } label: {
-                        Text(model.isBuilding ? "Building…" : "Build Splat")
+                        Text(model.isBuilding ? "Working…" : "Preview")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(TeslaButtonStyle(filled: true))
                     .disabled(model.isBuilding || model.selectedEventIDs.isEmpty || model.isBootstrapping)
 
-                    if model.isBuilding {
-                        Button("Cancel") { model.cancelBuild() }
-                            .buttonStyle(TeslaButtonStyle(filled: false))
+                    Button {
+                        Task { await model.refineToFull() }
+                    } label: {
+                        Text("Refine to full")
+                            .frame(maxWidth: .infinity)
                     }
+                    .buttonStyle(TeslaButtonStyle(filled: false))
+                    .disabled(
+                        model.isBuilding
+                            || model.selectedEventIDs.isEmpty
+                            || model.isBootstrapping
+                            || (!model.canRefine && model.lastPLYURL == nil)
+                    )
+                }
+
+                if model.isBuilding {
+                    Button("Cancel") { model.cancelBuild() }
+                        .buttonStyle(TeslaButtonStyle(filled: false))
                 }
 
                 Text(model.statusMessage)
@@ -117,7 +178,7 @@ struct ContentView: View {
             .padding(.top, 4)
         }
         .frame(maxWidth: .infinity)
-        .padding(.vertical, 28)
+        .padding(.vertical, 22)
         .padding(.horizontal, 12)
         .background(
             RoundedRectangle(cornerRadius: 16)
@@ -157,12 +218,21 @@ struct ContentView: View {
                         .font(.system(size: 13, weight: .semibold))
                         .tracking(1.0)
                         .foregroundStyle(Color(white: 0.45))
-                    Text("Build an event to orbit the splat")
+                    Text("Run Preview, then Refine to full")
                         .foregroundStyle(Color(white: 0.35))
                         .font(.system(size: 15))
+                    Text("Estimate ~2 min Preview · ~10–15 min Full / 1-min event (Max-class)")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Color(white: 0.3))
                 }
             }
         }
+    }
+
+    private func formatETA(_ sec: Double) -> String {
+        let s = Int(sec.rounded())
+        if s < 60 { return "~\(s)s left" }
+        return "~\(s / 60)m \(s % 60)s left"
     }
 
     private func pickFolder() {
@@ -189,6 +259,37 @@ struct ContentView: View {
             }
         }
         return true
+    }
+}
+
+struct LibraryRow: View {
+    let item: LibraryItem
+    let onTap: () -> Void
+
+    var body: some View {
+        Button(action: onTap) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(item.label ?? item.event_id)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Color(white: 0.9))
+                        .lineLimit(1)
+                    Text("\(item.tier.capitalized) · \(item.trainer ?? "?") · \(item.num_gaussians.map { "\($0) gs" } ?? "")")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Color(white: 0.45))
+                }
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Color(white: 0.35))
+            }
+            .padding(8)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color.white.opacity(0.04))
+            )
+        }
+        .buttonStyle(.plain)
     }
 }
 

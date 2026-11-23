@@ -13,9 +13,23 @@ struct DashcamEventDTO: Identifiable, Codable, Hashable {
     var source_folder: String?
 }
 
+struct LibraryItem: Identifiable, Codable, Hashable {
+    var id: String { "\(event_id)-\(tier)" }
+    var event_id: String
+    var label: String?
+    var tier: String
+    var ply: String?
+    var trainer: String?
+    var elapsed_sec: Double?
+    var num_gaussians: Int?
+    var warning: String?
+}
+
 struct PipelineProgress: Equatable {
     var message: String
     var fraction: Double
+    var stage: String?
+    var etaSec: Double?
 }
 
 @MainActor
@@ -30,9 +44,11 @@ final class AppModel: ObservableObject {
     @Published var lastPLYURL: URL?
     @Published var bootstrapNeeded = true
     @Published var logLines: [String] = []
+    @Published var library: [LibraryItem] = []
+    @Published var healthWarning: String?
+    @Published var canRefine = false
 
     private let bridge = PythonBridge()
-    private var buildTask: Process?
 
     func appendLog(_ line: String) {
         logLines.append(line)
@@ -44,7 +60,7 @@ final class AppModel: ObservableObject {
     func ensureBootstrap() async {
         guard bootstrapNeeded else { return }
         isBootstrapping = true
-        statusMessage = "Installing Python environment & models…"
+        statusMessage = "Installing Python environment, models & trainers…"
         progress = PipelineProgress(message: "Bootstrap", fraction: 0)
         defer {
             isBootstrapping = false
@@ -53,7 +69,7 @@ final class AppModel: ObservableObject {
         do {
             let code = try await bridge.bootstrap { [weak self] msg, frac in
                 Task { @MainActor in
-                    self?.progress = PipelineProgress(message: msg, fraction: frac)
+                    self?.progress = PipelineProgress(message: msg, fraction: frac, stage: "bootstrap")
                     self?.appendLog(msg)
                 }
             }
@@ -69,12 +85,14 @@ final class AppModel: ObservableObject {
     func ingest(folder: URL) async {
         folderURL = folder
         statusMessage = "Scanning \(folder.lastPathComponent)…"
+        healthWarning = nil
         do {
             let listed = try await bridge.listEvents(folder: folder)
             events = listed
             selectedEventIDs = Set(listed.prefix(1).map(\.id))
             statusMessage = listed.isEmpty ? "No events found" : "\(listed.count) event(s)"
             appendLog(statusMessage)
+            await refreshLibrary()
         } catch {
             statusMessage = "Scan failed: \(error.localizedDescription)"
             appendLog(statusMessage)
@@ -91,13 +109,20 @@ final class AppModel: ObservableObject {
 
     func cancelBuild() {
         bridge.requestCancel()
-        buildTask?.terminate()
         isBuilding = false
         statusMessage = "Cancelled"
         progress = nil
     }
 
-    func buildSelected() async {
+    func buildPreview() async {
+        await runBuild(tier: "preview")
+    }
+
+    func refineToFull() async {
+        await runBuild(tier: "full")
+    }
+
+    private func runBuild(tier: String) async {
         guard let folderURL else { return }
         let ids = Array(selectedEventIDs)
         guard !ids.isEmpty else {
@@ -105,32 +130,60 @@ final class AppModel: ObservableObject {
             return
         }
         isBuilding = true
-        progress = PipelineProgress(message: "Starting…", fraction: 0)
-        defer {
-            isBuilding = false
-        }
+        progress = PipelineProgress(message: tier == "full" ? "Refining to full…" : "Preview…", fraction: 0)
+        healthWarning = nil
+        defer { isBuilding = false }
         do {
             let result = try await bridge.build(
                 folder: folderURL,
                 eventIDs: ids,
-                onProgress: { [weak self] msg, frac in
+                tier: tier,
+                onProgress: { [weak self] msg, frac, stage, eta in
                     Task { @MainActor in
-                        self?.progress = PipelineProgress(message: msg, fraction: frac)
+                        self?.progress = PipelineProgress(
+                            message: msg,
+                            fraction: frac,
+                            stage: stage,
+                            etaSec: eta
+                        )
                         self?.appendLog(msg)
+                        if msg.lowercased().contains("encrypt") || msg.lowercased().contains("no sei") {
+                            self?.healthWarning = msg
+                        }
                     }
                 }
             )
             if let ply = result.plyURL {
                 lastPLYURL = ply
             }
+            canRefine = tier == "preview" && result.ok
+            if let warn = result.warning {
+                healthWarning = warn
+            }
             statusMessage = result.ok
-                ? "Built \(ids.count) event(s) → \(result.plyURL?.path ?? "")"
+                ? "\(tier.capitalized) done → \(result.plyURL?.lastPathComponent ?? "")"
                 : "Build failed (exit \(result.exitCode))"
             appendLog(statusMessage)
+            await refreshLibrary()
         } catch {
             statusMessage = "Build error: \(error.localizedDescription)"
             appendLog(statusMessage)
         }
         progress = nil
+    }
+
+    func refreshLibrary() async {
+        guard let folderURL else { return }
+        do {
+            library = try await bridge.loadLibrary(folder: folderURL)
+        } catch {
+            appendLog("library refresh: \(error.localizedDescription)")
+        }
+    }
+
+    func openLibraryItem(_ item: LibraryItem) {
+        if let ply = item.ply {
+            lastPLYURL = URL(fileURLWithPath: ply)
+        }
     }
 }
