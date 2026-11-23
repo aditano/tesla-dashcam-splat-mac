@@ -9,7 +9,9 @@ on:
 jobs:
   python-tests:
     name: Python unit + smoke
-    runs-on: macos-14
+    # GitHub retired macos-14 arm64 runners (macos-14-arm64-us-default unsupported).
+    # App still targets macOS 14+ via MACOSX_DEPLOYMENT_TARGET.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -44,7 +46,7 @@ jobs:
 
   macos-app:
     name: Build unsigned .app
-    runs-on: macos-14
+    runs-on: macos-15
     needs: python-tests
     steps:
       - uses: actions/checkout@v4
@@ -82,7 +84,7 @@ jobs:
 
   swift-tests:
     name: Swift tests
-    runs-on: macos-14
+    runs-on: macos-15
     needs: python-tests
     steps:
       - uses: actions/checkout@v4

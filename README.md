@@ -81,7 +81,7 @@ Apps/DashSplat/     SwiftUI front end + WKWebView viewer
 python/dashsplat/   SEI, events, MapAnything, train, CLI
 viewer/viewer.html  Orbit / drag splat viewer
 scripts/            build_app.sh, run_tests.sh
-.github/workflows/  macos-14 CI (pytest + xcodebuild + .app zip)
+.github/workflows/  macos-15 CI (pytest + xcodebuild + .app zip; app still targets macOS 14+)
 ```
 
 ## Screenshots
