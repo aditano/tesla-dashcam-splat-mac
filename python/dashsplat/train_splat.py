@@ -29,6 +29,7 @@ def train_splat(
     masks_dir: Path | None = None,
     trainer_name: str | None = None,
     force_fallback: bool = False,
+    detail: dict[str, Any] | None = None,
     progress: ProgressCb | None = None,
 ) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -40,6 +41,7 @@ def train_splat(
         max_splats=max_splats,
         masks_dir=masks_dir,
         force_fallback=force_fallback,
+        detail=detail or {},
     )
 
     if name == "seeded":

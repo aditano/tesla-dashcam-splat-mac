@@ -41,6 +41,7 @@ class MSplatTrainer:
         out_dir.mkdir(parents=True, exist_ok=True)
         ply = out_dir / "splat.ply"
 
+        detail = config.detail or {}
         cli = find_msplat_cli()
         if cli:
             cmd = [
@@ -51,7 +52,25 @@ class MSplatTrainer:
                 "--output",
                 str(ply),
             ]
+            # gsplat-compatible AbsGS / scale prune when CLI supports them
+            if detail.get("absgrad"):
+                cmd += ["--absgrad"]
+            if detail.get("max_scale") is not None:
+                cmd += ["--max-scale", str(detail["max_scale"])]
+            if detail.get("antialias"):
+                cmd += ["--antialias"]
             proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                # Retry without experimental detail flags
+                cmd = [
+                    str(cli),
+                    str(project_dir),
+                    "--iterations",
+                    str(config.iterations),
+                    "--output",
+                    str(ply),
+                ]
+                proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode != 0:
                 raise RuntimeError(f"msplat CLI failed ({proc.returncode}): {proc.stderr[-2000:]}")
             return TrainResult(
@@ -61,6 +80,7 @@ class MSplatTrainer:
                 cameras=str(out_dir / "cameras.json") if (out_dir / "cameras.json").exists() else None,
                 exit_code=proc.returncode,
                 log=proc.stdout[-2000:] if proc.stdout else None,
+                meta={"detail": detail},
             )
 
         # Python API path
@@ -70,12 +90,23 @@ class MSplatTrainer:
             raise RuntimeError("msplat not installed") from e
 
         # Best-effort: API surface varies by version; prefer a train() helper if present.
+        kwargs = {
+            "output": str(ply),
+            "iterations": config.iterations,
+        }
+        if detail.get("absgrad"):
+            kwargs["absgrad"] = True
+        if detail.get("max_scale") is not None:
+            kwargs["max_scale"] = detail["max_scale"]
         if hasattr(msplat, "train"):
-            msplat.train(  # type: ignore[attr-defined]
-                str(project_dir),
-                output=str(ply),
-                iterations=config.iterations,
-            )
+            try:
+                msplat.train(str(project_dir), **kwargs)  # type: ignore[attr-defined]
+            except TypeError:
+                msplat.train(  # type: ignore[attr-defined]
+                    str(project_dir),
+                    output=str(ply),
+                    iterations=config.iterations,
+                )
         else:
             raise RuntimeError(
                 "msplat is installed but exposes no known train() API; "
@@ -89,4 +120,5 @@ class MSplatTrainer:
             spz=None,
             cameras=str(out_dir / "cameras.json") if (out_dir / "cameras.json").exists() else None,
             exit_code=0,
+            meta={"detail": detail},
         )

@@ -2,12 +2,15 @@
 
 Timing numbers in docs are *estimates* from the 2026-11-23 research note;
 this module only encodes budgets (spacing, caps, iterations), not wall times.
+Fine-detail (trees) knobs live in detail_quality.py and are Full-tier defaults.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+
+from dashsplat.detail_quality import detail_for_tier
 
 
 class QualityTier(str, Enum):
@@ -32,34 +35,38 @@ class TierBudget:
     eta_prior_sec: float
 
 
-PREVIEW = TierBudget(
-    name=QualityTier.PREVIEW,
-    meters_per_keyframe=3.0,
-    max_frames_per_camera=60,
-    target_width=640,
-    mapanything_window=16,
-    mapanything_stride=8,
-    train_iterations=2500,
-    max_splats=300_000,
-    tile_length_m=100.0,
-    tile_overlap_m=20.0,
-    include_mover_masks=False,
-    eta_prior_sec=120.0,  # estimate ~2 min Preview on Max-class
+def _from_detail(tier: QualityTier, *, meters: float, max_frames: int, movers: bool, eta: float) -> TierBudget:
+    d = detail_for_tier(tier.value)
+    return TierBudget(
+        name=tier,
+        meters_per_keyframe=meters,
+        max_frames_per_camera=max_frames,
+        target_width=d.target_width,
+        mapanything_window=16,
+        mapanything_stride=8,
+        train_iterations=d.train_iterations + d.high_freq_extra_iters,
+        max_splats=int(d.max_splats_base * d.vegetation_splat_boost),
+        tile_length_m=100.0,
+        tile_overlap_m=20.0,
+        include_mover_masks=movers,
+        eta_prior_sec=eta,
+    )
+
+
+PREVIEW = _from_detail(
+    QualityTier.PREVIEW,
+    meters=3.0,
+    max_frames=60,
+    movers=False,
+    eta=120.0,
 )
 
-FULL = TierBudget(
-    name=QualityTier.FULL,
-    meters_per_keyframe=1.0,
-    max_frames_per_camera=300,
-    target_width=1280,
-    mapanything_window=16,
-    mapanything_stride=8,
-    train_iterations=7000,
-    max_splats=1_000_000,
-    tile_length_m=100.0,
-    tile_overlap_m=20.0,
-    include_mover_masks=True,
-    eta_prior_sec=720.0,  # estimate ~10–15 min Full on Max-class
+FULL = _from_detail(
+    QualityTier.FULL,
+    meters=1.0,
+    max_frames=300,
+    movers=True,
+    eta=720.0,
 )
 
 

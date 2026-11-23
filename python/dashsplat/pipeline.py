@@ -19,6 +19,7 @@ from dashsplat.accel.device import (
 from dashsplat.accel.tune import tune_for_host
 from dashsplat.bootstrap import support_layout
 from dashsplat.color_match import apply_affine, match_cameras_to_front
+from dashsplat.detail_quality import detail_for_tier, effective_iterations, effective_max_splats
 from dashsplat.detect import check_event_telemetry
 from dashsplat.events import DashcamEvent, scan_teslacam
 from dashsplat.frames import extract_event_frames
@@ -79,11 +80,17 @@ def build_event(
     budget = budget_for(tier)
     host = detect_host()
     tuned = tune_for_host(host, tier=budget.name)
+    detail = detail_for_tier(budget.name.value)
+    # Vegetation-aware splat budget (RAM-scaled) for Full thin structures
+    veg_splats = effective_max_splats(detail, host.ram_gb)
+    train_iters = iterations if iterations is not None else effective_iterations(detail)
     hw = profile_for_cameras(event.cameras or ["front"])
     stage_devices["host"] = host.to_dict()
     stage_devices["hw_profile"] = hw.to_dict()
     stage_devices["tuned"] = tuned.to_dict()
+    stage_devices["detail"] = detail.to_dict()
     (out_dir / "devices.json").write_text(json.dumps(stage_devices, indent=2))
+    (out_dir / "trainer_detail.json").write_text(json.dumps(detail.trainer_extra(), indent=2))
 
     def check() -> None:
         if cancel_check and cancel_check():
@@ -279,11 +286,12 @@ def build_event(
 
     # --- train (per tile in Full; single pass Preview) ---
     t_stage = time.time()
-    iters = iterations if iterations is not None else tuned.train_iterations
+    iters = train_iters
+    splat_cap = max(tuned.max_splats, veg_splats)
     train_dev = preferred_train_device(host).value
     _emit(
         progress,
-        f"Training splat ({budget.name.value}, {iters} iters, {train_dev})…",
+        f"Training splat ({budget.name.value}, {iters} iters, {train_dev}, detail={detail.densify_mode})…",
         0.6,
         stage="train",
         eta_sec=max(0.0, budget.eta_prior_sec - (time.time() - t0)),
@@ -295,10 +303,11 @@ def build_event(
         cameras,
         out_dir,
         iterations=iters,
-        max_splats=tuned.max_splats,
+        max_splats=splat_cap,
         masks_dir=masks_dir,
         trainer_name=trainer_name,
         force_fallback=force_fallback_trainer,
+        detail=detail.trainer_extra(),
         progress=progress,
     )
     # Flag silent CPU trainer when Apple Silicon expected Metal

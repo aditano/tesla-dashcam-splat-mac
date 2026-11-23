@@ -5,8 +5,35 @@ from typing import Any
 
 import numpy as np
 
+from dashsplat.detail_quality import FULL_DETAIL, PREVIEW_DETAIL, refine_thin_structure_scales
 from dashsplat.export import write_cameras_json, write_gaussian_ply, write_spz_stub
 from dashsplat.trainers.base import ProgressCb, TrainerConfig, TrainResult
+
+
+def _estimate_tangents(means: np.ndarray) -> np.ndarray | None:
+    """Cheap local PCA tangent without sklearn."""
+    n = means.shape[0]
+    if n < 3:
+        return None
+    # For each point, use a random subsample of neighbours by spatial hash bins
+    tangents = np.zeros_like(means)
+    # Sort by x then take sliding window
+    order = np.argsort(means[:, 0])
+    sorted_m = means[order]
+    window = min(12, n)
+    for i in range(n):
+        lo = max(0, i - window // 2)
+        hi = min(n, lo + window)
+        lo = max(0, hi - window)
+        pts = sorted_m[lo:hi]
+        pts = pts - pts.mean(axis=0)
+        try:
+            _, _, vh = np.linalg.svd(pts, full_matrices=False)
+            tangents[order[i]] = vh[0]
+        except np.linalg.LinAlgError:
+            tangents[order[i]] = np.array([1.0, 0.0, 0.0])
+    norms = np.linalg.norm(tangents, axis=1, keepdims=True) + 1e-8
+    return tangents / norms
 
 
 class SeededTrainer:
@@ -14,7 +41,12 @@ class SeededTrainer:
 
     name = "seeded"
 
-    def __init__(self, means: np.ndarray | None = None, colors: np.ndarray | None = None, cameras: list[dict[str, Any]] | None = None):
+    def __init__(
+        self,
+        means: np.ndarray | None = None,
+        colors: np.ndarray | None = None,
+        cameras: list[dict[str, Any]] | None = None,
+    ):
         self._means = means
         self._colors = colors
         self._cameras = cameras or []
@@ -22,7 +54,9 @@ class SeededTrainer:
     def is_available(self) -> bool:
         return True
 
-    def bind(self, means: np.ndarray, colors: np.ndarray, cameras: list[dict[str, Any]]) -> SeededTrainer:
+    def bind(
+        self, means: np.ndarray, colors: np.ndarray, cameras: list[dict[str, Any]]
+    ) -> SeededTrainer:
         self._means = means
         self._colors = colors
         self._cameras = cameras
@@ -45,17 +79,19 @@ class SeededTrainer:
         spz = out_dir / "splat.spz"
         means = self._means
         colors = self._colors
-        if means.shape[0] > 1:
-            sample = means[: min(2000, means.shape[0])]
-            d = np.linalg.norm(sample[None, :, :] - sample[:, None, :], axis=-1)
-            np.fill_diagonal(d, np.inf)
-            nn = np.min(d, axis=1)
-            med = float(np.median(nn[np.isfinite(nn)])) if np.any(np.isfinite(nn)) else 0.05
-            scale = max(0.01, min(0.25, med * 1.5))
+        detail = config.detail or {}
+        # Prefer Full thin-structure settings when absgrad / tight max_scale requested
+        if detail.get("absgrad") or float(detail.get("max_scale", 1.0)) <= 0.15:
+            dq = FULL_DETAIL
         else:
-            scale = 0.05
-        scales = np.full((means.shape[0], 3), scale, dtype=np.float32)
-        # Honor max_splats cap
+            dq = PREVIEW_DETAIL
+        if detail.get("max_scale") is not None:
+            # Override cap from trainer config
+            from dataclasses import replace
+
+            dq = replace(dq, max_scale_m=float(detail["max_scale"]))
+        tangents = _estimate_tangents(means)
+        scales = refine_thin_structure_scales(means, tangents, dq)
         if means.shape[0] > config.max_splats:
             rng = np.random.default_rng(0)
             idx = rng.choice(means.shape[0], config.max_splats, replace=False)
@@ -74,5 +110,9 @@ class SeededTrainer:
             cameras=str(out_dir / "cameras.json"),
             exit_code=0,
             num_gaussians=int(means.shape[0]),
-            meta={"reason": "seeded-fallback", "scale": scale},
+            meta={
+                "reason": "seeded-fallback",
+                "max_scale": float(np.max(scales)),
+                "detail": detail,
+            },
         )

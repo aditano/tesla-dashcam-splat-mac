@@ -14,6 +14,8 @@ class TrainerConfig:
     max_splats: int = 300_000
     masks_dir: Path | None = None
     force_fallback: bool = False
+    # Thin-structure / Full-tier densification knobs (AbsGS, MCMC, scale cap, AA…)
+    detail: dict[str, Any] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)
 
 

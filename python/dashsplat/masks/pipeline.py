@@ -9,6 +9,7 @@ import numpy as np
 from PIL import Image
 
 from dashsplat.cameras import CameraId
+from dashsplat.detail_quality import detail_for_tier
 from dashsplat.masks.ego import ego_mask_array
 from dashsplat.masks.movers import mover_mask
 from dashsplat.masks.sky import sky_mask
@@ -38,6 +39,7 @@ def build_masks_for_frames(
     Returns (masks_dir, device_report).
     """
     budget = budget_for(tier)
+    detail = detail_for_tier(budget.name.value)
     out_dir.mkdir(parents=True, exist_ok=True)
     prev_by_cam: dict[str, Path] = {}
     devices: dict[str, str] = {"sky": "unknown", "movers": "unknown", "compute_units": compute_units}
@@ -49,14 +51,25 @@ def build_masks_for_frames(
         with Image.open(path) as im:
             w, h = im.size
         ego = ego_mask_array(cam, w, h)
-        sky, sky_dev = sky_mask(path, compute_units=compute_units)
+        sky, sky_dev = sky_mask(
+            path,
+            compute_units=compute_units,
+            protect_vegetation=detail.protect_vegetation_edges,
+            erode_px=detail.sky_mask_erode_px,
+        )
         devices["sky"] = sky_dev
         if sky.shape != ego.shape:
             sky = np.asarray(Image.fromarray(sky).resize((w, h), Image.NEAREST))
         parts = [ego, sky]
         if budget.include_mover_masks:
             prev = prev_by_cam.get(cam)
-            mv, mv_dev = mover_mask(path, prev, speed_mps=float(fr.get("speed_mps", 0.0)))
+            mv, mv_dev = mover_mask(
+                path,
+                prev,
+                speed_mps=float(fr.get("speed_mps", 0.0)),
+                protect_vegetation=detail.protect_vegetation_edges,
+                erode_px=detail.mover_mask_erode_px,
+            )
             devices["movers"] = mv_dev
             if mv.shape != ego.shape:
                 mv = np.asarray(Image.fromarray(mv).resize((w, h), Image.NEAREST))

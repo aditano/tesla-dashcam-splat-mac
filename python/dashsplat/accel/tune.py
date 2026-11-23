@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 
 from dashsplat.accel.device import HostInfo
+from dashsplat.detail_quality import detail_for_tier, effective_iterations, effective_max_splats
 from dashsplat.tiers import QualityTier, budget_for
 
 
@@ -20,6 +21,8 @@ class TunedBudget:
     tile_length_m: float
     ram_gb: float
     chip: str
+    detail_densify: str = "mcmc"
+    max_scale_m: float = 0.35
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -52,7 +55,10 @@ def tune_for_host(host: HostInfo, tier: QualityTier | str = "preview") -> TunedB
     elif klass == "base":
         mem_scale = min(mem_scale, 1.0)
 
-    max_splats = int(base.max_splats * mem_scale)
+    detail = detail_for_tier(base.name.value)
+    max_splats = effective_max_splats(detail, ram_gb)
+    # Also honor legacy mem_scale floor from base
+    max_splats = max(max_splats, int(base.max_splats * mem_scale * 0.5))
     window = int(base.mapanything_window)
     if ram_gb >= 64:
         window = min(32, window * 2)
@@ -74,7 +80,7 @@ def tune_for_host(host: HostInfo, tier: QualityTier | str = "preview") -> TunedB
     return TunedBudget(
         tier=base.name.value if hasattr(base.name, "value") else str(base.name),
         max_splats=max_splats,
-        train_iterations=base.train_iterations,
+        train_iterations=effective_iterations(detail),
         mapanything_window=window,
         mapanything_stride=base.mapanything_stride,
         decode_parallel_cameras=parallel,
@@ -82,4 +88,6 @@ def tune_for_host(host: HostInfo, tier: QualityTier | str = "preview") -> TunedB
         tile_length_m=base.tile_length_m,
         ram_gb=round(ram_gb, 2),
         chip=host.chip,
+        detail_densify=detail.densify_mode,
+        max_scale_m=detail.max_scale_m,
     )
