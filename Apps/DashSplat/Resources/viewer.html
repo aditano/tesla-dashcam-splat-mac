@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DashSplat Viewer</title>
+  <style>
+    :root { color-scheme: dark; }
+    html, body { margin: 0; height: 100%; background: #0a0a0a; overflow: hidden; font-family: "SF Pro Display", "Inter", system-ui, sans-serif; }
+    #c { width: 100%; height: 100%; display: block; cursor: grab; }
+    #c:active { cursor: grabbing; }
+    #hud {
+      position: absolute; left: 16px; bottom: 16px; color: #8a8a8a; font-size: 12px;
+      background: rgba(22,22,22,0.85); border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 12px; padding: 10px 12px; pointer-events: none;
+    }
+    #err { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; color: #c44; }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <div id="hud">Drag to orbit · Scroll to zoom</div>
+  <div id="err"></div>
+  <script>
+    // Lightweight point/splat orbit viewer. Spark can replace this later;
+    // for the Mac app we keep a self-contained WebGL2 renderer that loads
+    // ASCII XYZRGB PLY or binary 3DGS PLY (xyz + f_dc).
+    const canvas = document.getElementById('c');
+    const hud = document.getElementById('hud');
+    const err = document.getElementById('err');
+    const gl = canvas.getContext('webgl2', { antialias: true });
+    if (!gl) {
+      err.style.display = 'flex';
+      err.textContent = 'WebGL2 required';
+    }
+
+    const params = new URLSearchParams(location.search);
+    const plyURL = params.get('ply');
+
+    let yaw = 0.6, pitch = 0.35, dist = 18;
+    let target = [0, 0, 0];
+    let dragging = false, lastX = 0, lastY = 0;
+
+    canvas.addEventListener('pointerdown', e => { dragging = true; lastX = e.clientX; lastY = e.clientY; canvas.setPointerCapture(e.pointerId); });
+    canvas.addEventListener('pointerup', () => dragging = false);
+    canvas.addEventListener('pointermove', e => {
+      if (!dragging) return;
+      yaw += (e.clientX - lastX) * 0.005;
+      pitch += (e.clientY - lastY) * 0.005;
+      pitch = Math.max(-1.4, Math.min(1.4, pitch));
+      lastX = e.clientX; lastY = e.clientY;
+    });
+    canvas.addEventListener('wheel', e => {
+      dist *= Math.exp(e.deltaY * 0.0015);
+      dist = Math.max(1.5, Math.min(200, dist));
+      e.preventDefault();
+    }, { passive: false });
+
+    const vs = `#version 300 es
+    precision highp float;
+    layout(location=0) in vec3 a_pos;
+    layout(location=1) in vec3 a_col;
+    uniform mat4 u_mvp;
+    uniform float u_point;
+    out vec3 v_col;
+    void main(){
+      v_col = a_col;
+      gl_Position = u_mvp * vec4(a_pos, 1.0);
+      gl_PointSize = u_point;
+    }`;
+    const fs = `#version 300 es
+    precision highp float;
+    in vec3 v_col;
+    out vec4 o;
+    void main(){
+      vec2 p = gl_PointCoord * 2.0 - 1.0;
+      float r = dot(p,p);
+      if(r > 1.0) discard;
+      float a = exp(-r * 2.2);
+      o = vec4(v_col, a);
+    }`;
+
+    function compile(type, src) {
+      const s = gl.createShader(type);
+      gl.shaderSource(s, src);
+      gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+      return s;
+    }
+    const prog = gl.createProgram();
+    gl.attachShader(prog, compile(gl.VERTEX_SHADER, vs));
+    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fs));
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    const uMVP = gl.getUniformLocation(prog, 'u_mvp');
+    const uPoint = gl.getUniformLocation(prog, 'u_point');
+
+    let count = 0;
+    const vao = gl.createVertexArray();
+
+    function mat4Perspective(fovy, aspect, near, far) {
+      const f = 1 / Math.tan(fovy / 2);
+      const m = new Float32Array(16);
+      m[0] = f / aspect; m[5] = f;
+      m[10] = (far + near) / (near - far);
+      m[11] = -1;
+      m[14] = (2 * far * near) / (near - far);
+      return m;
+    }
+    function mul(a, b) {
+      const o = new Float32Array(16);
+      for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+        o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+      }
+      return o;
+    }
+    function lookAt(eye, center, up) {
+      const z = normalize(sub(eye, center));
+      const x = normalize(cross(up, z));
+      const y = cross(z, x);
+      return new Float32Array([
+        x[0], y[0], z[0], 0,
+        x[1], y[1], z[1], 0,
+        x[2], y[2], z[2], 0,
+        -dot(x, eye), -dot(y, eye), -dot(z, eye), 1
+      ]);
+    }
+    const sub = (a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]];
+    const cross = (a,b)=>[a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+    const dot = (a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+    const normalize = a => { const l=Math.hypot(a[0],a[1],a[2])||1; return [a[0]/l,a[1]/l,a[2]/l]; };
+
+    function resize() {
+      const dpr = Math.min(devicePixelRatio || 1, 2);
+      const w = canvas.clientWidth, h = canvas.clientHeight;
+      canvas.width = Math.floor(w * dpr);
+      canvas.height = Math.floor(h * dpr);
+      gl.viewport(0, 0, canvas.width, canvas.height);
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    function frame() {
+      resize();
+      const eye = [
+        target[0] + dist * Math.cos(pitch) * Math.sin(yaw),
+        target[1] + dist * Math.sin(pitch),
+        target[2] + dist * Math.cos(pitch) * Math.cos(yaw),
+      ];
+      const aspect = canvas.width / Math.max(canvas.height, 1);
+      const P = mat4Perspective(Math.PI / 3, aspect, 0.05, 500);
+      const V = lookAt(eye, target, [0, 1, 0]);
+      const MVP = mul(P, V);
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      gl.clearColor(0.04, 0.04, 0.04, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+      gl.useProgram(prog);
+      gl.uniformMatrix4fv(uMVP, false, MVP);
+      gl.uniform1f(uPoint, Math.max(2.0, 180 / dist));
+      gl.bindVertexArray(vao);
+      gl.drawArrays(gl.POINTS, 0, count);
+      requestAnimationFrame(frame);
+    }
+
+    async function loadPLY(url) {
+      hud.textContent = 'Loading splat…';
+      const res = await fetch(url);
+      const buf = await res.arrayBuffer();
+      const textHead = new TextDecoder().decode(buf.slice(0, Math.min(buf.byteLength, 4096)));
+      if (!textHead.startsWith('ply')) throw new Error('Not a PLY');
+      const headerEnd = textHead.indexOf('end_header');
+      const header = textHead.slice(0, headerEnd);
+      const isAscii = /format ascii/i.test(header);
+      const nMatch = header.match(/element vertex (\d+)/);
+      const n = nMatch ? parseInt(nMatch[1], 10) : 0;
+      const props = [...header.matchAll(/property (\w+) (\w+)/g)].map(m => m[2]);
+      let positions = new Float32Array(n * 3);
+      let colors = new Float32Array(n * 3);
+      if (isAscii) {
+        const full = new TextDecoder().decode(buf);
+        const body = full.split('end_header')[1].trim().split(/\n/);
+        for (let i = 0; i < n; i++) {
+          const p = body[i].trim().split(/\s+/).map(Number);
+          positions[i*3] = p[0]; positions[i*3+1] = p[1]; positions[i*3+2] = p[2];
+          if (props.includes('red')) {
+            const ri = props.indexOf('red');
+            colors[i*3] = p[ri]/255; colors[i*3+1] = p[ri+1]/255; colors[i*3+2] = p[ri+2]/255;
+          } else {
+            colors[i*3] = colors[i*3+1] = colors[i*3+2] = 0.8;
+          }
+        }
+      } else {
+        // binary_little_endian — assume our 17-float gaussian layout or xyzrgb
+        const headerBytes = new TextEncoder().encode(textHead.slice(0, headerEnd) + 'end_header\n').length;
+        // Recompute exact header length from original bytes
+        const bytes = new Uint8Array(buf);
+        let off = 0;
+        const asStr = new TextDecoder().decode(bytes);
+        const idx = asStr.indexOf('end_header\n');
+        off = idx >= 0 ? idx + 'end_header\n'.length : headerBytes;
+        const view = new DataView(buf, off);
+        const hasDC = props.includes('f_dc_0');
+        const strideFloats = hasDC ? 17 : (props.includes('red') ? 6 : 3);
+        for (let i = 0; i < n; i++) {
+          const base = i * strideFloats * 4;
+          positions[i*3] = view.getFloat32(base, true);
+          positions[i*3+1] = view.getFloat32(base + 4, true);
+          positions[i*3+2] = view.getFloat32(base + 8, true);
+          if (hasDC) {
+            const sh = 0.28209479177387814;
+            colors[i*3] = view.getFloat32(base + 24, true) * sh + 0.5;
+            colors[i*3+1] = view.getFloat32(base + 28, true) * sh + 0.5;
+            colors[i*3+2] = view.getFloat32(base + 32, true) * sh + 0.5;
+          } else {
+            colors[i*3] = colors[i*3+1] = colors[i*3+2] = 0.85;
+          }
+        }
+      }
+      // Center + scale camera
+      let cx=0,cy=0,cz=0;
+      for (let i=0;i<n;i++){ cx+=positions[i*3]; cy+=positions[i*3+1]; cz+=positions[i*3+2]; }
+      cx/=Math.max(n,1); cy/=Math.max(n,1); cz/=Math.max(n,1);
+      target = [cx, cy, cz];
+      let maxR = 1;
+      for (let i=0;i<n;i++){
+        const dx=positions[i*3]-cx, dy=positions[i*3+1]-cy, dz=positions[i*3+2]-cz;
+        maxR = Math.max(maxR, Math.hypot(dx,dy,dz));
+      }
+      dist = maxR * 2.2;
+
+      count = n;
+      gl.bindVertexArray(vao);
+      const pb = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, pb);
+      gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+      const cb = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, cb);
+      gl.bufferData(gl.ARRAY_BUFFER, colors, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(1);
+      gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+      hud.textContent = `${n.toLocaleString()} points · drag to orbit · scroll zoom`;
+    }
+
+    if (plyURL) {
+      loadPLY(plyURL).then(() => requestAnimationFrame(frame)).catch(e => {
+        err.style.display = 'flex';
+        err.textContent = String(e);
+      });
+    } else {
+      hud.textContent = 'No PLY provided';
+      requestAnimationFrame(frame);
+    }
+  </script>
+</body>
+</html>
