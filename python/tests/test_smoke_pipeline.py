@@ -35,6 +35,7 @@ def test_smoke_pipeline_synthetic(tmp_path: Path):
         force_fallback_trainer=True,
         iterations=10,
         max_frames_per_camera=2,
+        tier="preview",
     )
     assert summary["exit_code"] == 0, summary
     assert summary["ok"] is True
@@ -43,6 +44,8 @@ def test_smoke_pipeline_synthetic(tmp_path: Path):
     assert Path(r["ply"]).exists()
     assert Path(r["spz"]).exists()
     assert Path(r["cameras"]).exists()
-    assert r["trainer"] == "seeded-fallback"
+    assert r["trainer"] == "seeded"
+    assert r["tier"] == "preview"
     assert r["trajectory_source"] == "sei"
     assert r["num_gaussians"] > 0
+    assert (out / "library.json").exists()

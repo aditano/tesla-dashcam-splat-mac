@@ -7,8 +7,11 @@ import subprocess
 from pathlib import Path
 from typing import Callable
 
+from PIL import Image, ImageDraw
+
 from dashsplat.cameras import HW3_CAMERA_RIG, CameraId, CameraExtrinsics, intrinsics_matrix
 from dashsplat.events import DashcamEvent
+from dashsplat.timing_offsets import apply_offset, load_offsets
 from dashsplat.trajectory import Pose, apply_vehicle_camera_offset
 
 ProgressCb = Callable[[str, float], None]
@@ -55,8 +58,6 @@ def extract_placeholder_frames(
     height: int = 240,
 ) -> list[Path]:
     """When ffmpeg is missing (or synthetic SEI-only MP4s), write solid-color placeholders."""
-    from PIL import Image, ImageDraw
-
     out_dir.mkdir(parents=True, exist_ok=True)
     # Deterministic color from camera prefix hash
     hue = sum(ord(c) for c in prefix) % 200 + 30
@@ -78,6 +79,7 @@ def extract_event_frames(
     poses: list[Pose],
     *,
     max_frames_per_camera: int = 6,
+    offsets_path: Path | None = None,
     progress: ProgressCb | None = None,
 ) -> tuple[list[Path], list[list[list[float]]], list[list[list[float]]], list[dict]]:
     """Return image paths, intrinsics, c2w poses, and camera dicts for training."""
@@ -86,6 +88,7 @@ def extract_event_frames(
     Ks: list[list[list[float]]] = []
     c2ws: list[list[list[float]]] = []
     cameras: list[dict] = []
+    offsets = load_offsets(offsets_path or (work_dir / "timing_offsets.json"))
 
     cam_ids: list[CameraId] = list(event.cameras) or ["front"]
     use_ffmpeg = _have_ffmpeg()
@@ -127,9 +130,6 @@ def extract_event_frames(
             )
 
         K = intrinsics_matrix(cam)
-        # Scale intrinsics if placeholder resolution differs
-        from PIL import Image
-
         for fi, frame in enumerate(frames):
             with Image.open(frame) as im:
                 w, h = im.size
@@ -140,9 +140,16 @@ def extract_event_frames(
                 [0.0, K[1][1] * scale_y, K[1][2] * scale_y],
                 [0.0, 0.0, 1.0],
             ]
-            # Sample pose along trajectory
+            # Sample pose along trajectory (with per-camera time offset)
             if poses:
-                pidx = min(int(fi / max(len(frames) - 1, 1) * (len(poses) - 1)), len(poses) - 1)
+                frac = fi / max(len(frames) - 1, 1)
+                raw_t = poses[0].time_sec + frac * (poses[-1].time_sec - poses[0].time_sec)
+                t = apply_offset(raw_t, cam_id, offsets)
+                # nearest pose by time
+                pidx = min(
+                    range(len(poses)),
+                    key=lambda i: abs(poses[i].time_sec - t),
+                )
                 vehicle = poses[pidx]
             else:
                 from dashsplat.trajectory import Pose as P
@@ -168,7 +175,7 @@ def extract_event_frames(
                     "cy": K_scaled[1][2],
                     "w": w,
                     "h": h,
-                    "time_sec": cam_pose.time_sec,
+                    "time_sec": apply_offset(cam_pose.time_sec, cam_id, offsets),
                 }
             )
             idx += 1

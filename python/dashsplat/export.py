@@ -125,7 +125,7 @@ def write_simple_point_ply(path: Path, points: np.ndarray, colors: np.ndarray) -
 def write_spz_stub(path: Path, means: np.ndarray, colors: np.ndarray) -> None:
     """Minimal .spz sidecar: JSON gzip of positions+colors for Spark-compatible tooling.
 
-    True Niantic SPZ binary needs OpenSplat; when OpenSplat runs it writes real .spz.
+    True Niantic SPZ binary needs a Metal trainer that emits SPZ (Brush/msplat when available).
     This stub keeps the export path working in the seeded fallback trainer.
     """
     import gzip

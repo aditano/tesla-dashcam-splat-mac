@@ -13,6 +13,7 @@ from typing import Any, Callable
 import numpy as np
 
 MAPANYTHING_REPO = "mlx-community/map-anything-apache-fp16"
+MAPANYTHING_NC_REPO = "mlx-community/map-anything-fp16"  # CC BY-NC; opt-in only
 
 
 ProgressCb = Callable[[str, float], None]
@@ -106,6 +107,101 @@ def run_mapanything_mlx(
         "backend": "mlx-mapanything",
         "model_id": model_id,
     }
+
+
+def run_mapanything_windows(
+    image_paths: list[Path],
+    intrinsics: list[list[list[float]]],
+    camera_poses: list[list[list[float]]],
+    *,
+    window: int = 16,
+    stride: int = 8,
+    use_nc_weights: bool = False,
+    model_id: str | None = None,
+    cache_dir: Path | None = None,
+    progress: ProgressCb | None = None,
+) -> dict[str, Any]:
+    """Run MapAnything over overlapping windows that mix all cameras/times.
+
+    Always passes HW3 intrinsics + telemetry poses. Default weights are Apache;
+    set use_nc_weights=True for the personal-use CC BY-NC variant (off by default).
+    """
+    mid = model_id or (MAPANYTHING_NC_REPO if use_nc_weights else MAPANYTHING_REPO)
+    n = len(image_paths)
+    if n == 0:
+        raise ValueError("no images")
+    if n <= window:
+        return run_mapanything_mlx(
+            image_paths,
+            intrinsics=intrinsics,
+            camera_poses=camera_poses,
+            model_id=mid,
+            cache_dir=cache_dir,
+            progress=progress,
+        )
+
+    # Accumulate best-confidence per view
+    all_pts = None
+    all_col = None
+    all_conf = None
+    starts = list(range(0, max(1, n - window + 1), stride))
+    if starts[-1] != n - window:
+        starts.append(max(0, n - window))
+    for wi, start in enumerate(starts):
+        end = min(n, start + window)
+        sl = slice(start, end)
+        _progress(progress, f"MapAnything window {wi+1}/{len(starts)}…", 0.3 + 0.4 * wi / len(starts))
+        chunk = run_mapanything_mlx(
+            image_paths[sl],
+            intrinsics=intrinsics[sl],
+            camera_poses=camera_poses[sl],
+            model_id=mid,
+            cache_dir=cache_dir,
+            progress=None,
+        )
+        if all_pts is None:
+            # Init full buffers from first window sizes
+            h, w = chunk["pts3d"].shape[1:3]
+            all_pts = np.zeros((n, h, w, 3), dtype=np.float32)
+            all_col = np.zeros((n, h, w, 3), dtype=np.float32)
+            all_conf = np.zeros((n, h, w), dtype=np.float32)
+        for local_i, global_i in enumerate(range(start, end)):
+            conf = chunk["conf"][local_i]
+            better = conf > all_conf[global_i]
+            all_pts[global_i][better] = chunk["pts3d"][local_i][better]
+            all_col[global_i][better] = chunk["colors"][local_i][better]
+            all_conf[global_i] = np.maximum(all_conf[global_i], conf)
+    return {
+        "pts3d": all_pts,
+        "colors": all_col,
+        "conf": all_conf,
+        "camera_poses": camera_poses,
+        "intrinsics": intrinsics,
+        "backend": "mlx-mapanything-windows",
+        "model_id": mid,
+        "use_nc_weights": use_nc_weights,
+    }
+
+
+def voxel_downsample(
+    means: np.ndarray,
+    colors: np.ndarray,
+    voxel_m: float = 0.08,
+    max_points: int = 400_000,
+) -> tuple[np.ndarray, np.ndarray]:
+    if means.shape[0] == 0:
+        return means, colors
+    keys = np.floor(means / max(voxel_m, 1e-4)).astype(np.int32)
+    # Hash
+    _, unique_idx = np.unique(keys, axis=0, return_index=True)
+    means_d = means[unique_idx]
+    colors_d = colors[unique_idx]
+    if means_d.shape[0] > max_points:
+        rng = np.random.default_rng(0)
+        pick = rng.choice(means_d.shape[0], max_points, replace=False)
+        means_d = means_d[pick]
+        colors_d = colors_d[pick]
+    return means_d.astype(np.float32), colors_d.astype(np.float32)
 
 
 def synthetic_pointmap_from_poses(
