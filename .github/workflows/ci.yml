@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  python-tests:
+    name: Python unit + smoke
+    # GitHub retired macos-14 arm64 runners (macos-14-arm64-us-default unsupported).
+    # App still targets macOS 14+ via MACOSX_DEPLOYMENT_TARGET.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: |
+          python3 -m pip install -U pip
+          python3 -m pip install -e "python/[dev]"
+      - name: Generate synthetic fixtures
+        run: |
+          python3 python/tools/generate_synthetic_clip.py --out fixtures/synthetic
+          mkdir -p fixtures/sample_teslacam/SavedClips/2025-11-20_14-03-12
+          cp fixtures/synthetic/*.mp4 fixtures/sample_teslacam/SavedClips/2025-11-20_14-03-12/
+          echo '{"city":"Palo Alto","est_lat":37.3947,"est_lon":-122.1503}' > fixtures/sample_teslacam/SavedClips/2025-11-20_14-03-12/event.json
+      - name: Pytest
+        working-directory: python
+        run: |
+          set +e
+          python3 -m pytest -q
+          code=$?
+          echo "pytest_exit_code=$code"
+          exit $code
+      - name: CLI list smoke
+        run: |
+          export PYTHONPATH="$PWD/python"
+          set +e
+          python3 -m dashsplat.cli list fixtures/sample_teslacam --json
+          code=$?
+          echo "cli_list_exit_code=$code"
+          exit $code
+
+  macos-app:
+    name: Build unsigned .app
+    runs-on: macos-15
+    needs: python-tests
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate + build
+        run: |
+          set +e
+          xcodegen generate
+          xcodebuild \
+            -project DashSplat.xcodeproj \
+            -scheme DashSplat \
+            -configuration Release \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY=- \
+            build
+          code=$?
+          echo "xcodebuild_exit_code=$code"
+          exit $code
+      - name: Package zip
+        run: |
+          mkdir -p dist
+          APP=$(find build/DerivedData/Build/Products/Release -name 'DashSplat.app' -maxdepth 2 | head -n1)
+          cp -R "$APP" dist/DashSplat.app
+          rsync -a python/ dist/DashSplat.app/Contents/Resources/python/
+          rsync -a viewer/ dist/DashSplat.app/Contents/Resources/
+          (cd dist && zip -r DashSplat-unsigned.zip DashSplat.app)
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DashSplat-unsigned
+          path: dist/DashSplat-unsigned.zip
+          if-no-files-found: error
+
+  swift-tests:
+    name: Swift tests
+    runs-on: macos-15
+    needs: python-tests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Prep fixtures + python
+        run: |
+          python3 -m pip install -e "python/[dev]"
+          python3 python/tools/generate_synthetic_clip.py --out fixtures/synthetic
+          mkdir -p fixtures/sample_teslacam/SavedClips/2025-11-20_14-03-12
+          cp fixtures/synthetic/*.mp4 fixtures/sample_teslacam/SavedClips/2025-11-20_14-03-12/
+          echo '{"city":"Palo Alto","est_lat":37.3947,"est_lon":-122.1503}' > fixtures/sample_teslacam/SavedClips/2025-11-20_14-03-12/event.json
+      - name: XcodeGen + test
+        run: |
+          brew install xcodegen
+          xcodegen generate
+          set +e
+          xcodebuild \
+            -project DashSplat.xcodeproj \
+            -scheme DashSplat \
+            -destination 'platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            test
+          code=$?
+          echo "xcodebuild_test_exit_code=$code"
+          exit $code

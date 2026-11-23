@@ -1,0 +1,49 @@
+name: DashSplat
+options:
+  bundleIdPrefix: com.aditano
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGNING_ALLOWED: "NO"
+    CODE_SIGNING_REQUIRED: "NO"
+    DEVELOPMENT_TEAM: ""
+targets:
+  DashSplat:
+    type: application
+    platform: macOS
+    sources:
+      - path: Apps/DashSplat
+      - path: viewer
+        buildPhase: resources
+        type: folder
+      - path: python
+        buildPhase: resources
+        type: folder
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.aditano.dashsplat
+        PRODUCT_NAME: DashSplat
+        INFOPLIST_FILE: Apps/DashSplat/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        LD_RUNPATH_SEARCH_PATHS: "@executable_path/../Frameworks"
+        ENABLE_HARDENED_RUNTIME: NO
+    scheme:
+      testTargets:
+        - DashSplatTests
+  DashSplatTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Apps/DashSplatTests
+    dependencies:
+      - target: DashSplat
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.aditano.dashsplat.tests
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGNING_ALLOWED: "NO"
