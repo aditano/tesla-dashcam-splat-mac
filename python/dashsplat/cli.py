@@ -19,24 +19,6 @@ def main(argv: list[str] | None = None) -> int:
     p_list = sub.add_parser("list", help="List events in a TeslaCam folder")
     p_list.add_argument("folder", type=Path)
     p_list.add_argument("--json", action="store_true")
-    p_list.add_argument(
-        "--no-ego-identity",
-        action="store_true",
-        help="Skip ego paint/model identification (faster)",
-    )
-    p_list.add_argument(
-        "--ego-override",
-        type=Path,
-        default=None,
-        help="JSON override {model,paint_name,paint_code} for ego identity",
-    )
-
-    p_ego = sub.add_parser("ego-override", help="Set/clear owner vehicle paint+model override")
-    p_ego.add_argument("--model", default=None, help='e.g. "Model Y"')
-    p_ego.add_argument("--paint", dest="paint_name", default=None, help='e.g. "Pearl White Multi-Coat"')
-    p_ego.add_argument("--paint-code", default=None, help="e.g. PPSW")
-    p_ego.add_argument("--clear", action="store_true", help="Remove override file")
-    p_ego.add_argument("--path", type=Path, default=None, help="Override JSON path")
 
     def add_build_args(p: argparse.ArgumentParser) -> None:
         p.add_argument("folder", type=Path)
@@ -83,77 +65,20 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "list":
         from dashsplat.events import scan_teslacam
-        from dashsplat.hw_profile import profile_for_cameras
 
         events = scan_teslacam(args.folder)
-        payloads: list[dict] = []
-        if args.no_ego_identity:
-            payloads = [e.to_dict() for e in events]
-        else:
-            import tempfile
-
-            from dashsplat.ego_identity import (
-                enrich_event_dict_with_identity,
-                extract_repeater_stills_for_identity,
-                load_override,
-            )
-
-            override = None
-            if args.ego_override:
-                override = json.loads(Path(args.ego_override).read_text())
-            else:
-                override = load_override()
-            with tempfile.TemporaryDirectory(prefix="dashsplat-ego-") as td:
-                for e in events:
-                    hw = profile_for_cameras(e.cameras)
-                    frames = extract_repeater_stills_for_identity(
-                        e, Path(td) / e.id, max_frames=3
-                    )
-                    payloads.append(
-                        enrich_event_dict_with_identity(
-                            e.to_dict(),
-                            frames=frames,
-                            hw_generation=hw.generation.value,
-                            override=override,
-                        )
-                    )
         if args.json:
-            print(json.dumps(payloads, indent=2))
+            print(json.dumps([e.to_dict() for e in events], indent=2))
         else:
-            if not payloads:
+            if not events:
                 print("No events found", file=sys.stderr)
                 return 2
-            for d in payloads:
-                cams = ",".join(d.get("cameras") or [])
-                loc = d.get("location_label") or "-"
-                ego = d.get("ego_summary") or ""
+            for e in events:
+                cams = ",".join(e.cameras)
+                loc = e.location_label or "-"
                 print(
-                    f"{d['id']}\t{d['label']}\t{d.get('duration_sec', 0):.0f}s\t"
-                    f"{cams}\t{loc}\t{d.get('source_folder') or ''}\t{ego}"
+                    f"{e.id}\t{e.label}\t{e.duration_sec:.0f}s\t{cams}\t{loc}\t{e.source_folder or ''}"
                 )
-        return 0
-
-    if args.cmd == "ego-override":
-        from dashsplat.ego_identity import default_override_path, load_override, save_override
-
-        path = args.path or default_override_path()
-        if args.clear:
-            if path.is_file():
-                path.unlink()
-            print(json.dumps({"cleared": True, "path": str(path)}))
-            return 0
-        data = load_override(path) or {}
-        if args.model:
-            data["model"] = args.model
-        if args.paint_name:
-            data["paint_name"] = args.paint_name
-        if args.paint_code:
-            data["paint_code"] = args.paint_code
-        if not data:
-            print(json.dumps({"error": "provide --model/--paint/--paint-code or --clear"}, indent=2))
-            return 2
-        save_override(data, path)
-        print(json.dumps({"saved": data, "path": str(path)}, indent=2))
         return 0
 
     if args.cmd == "bootstrap":
@@ -215,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def main_folder_argv() -> int:
     argv = sys.argv[1:]
-    known = {"list", "build", "bootstrap", "run", "refine", "bench", "doctor", "ego-override", "help"}
+    known = {"list", "build", "bootstrap", "run", "refine", "bench", "doctor", "help"}
     if argv and not argv[0].startswith("-") and argv[0] not in known:
         return main(["run", *argv])
     if not argv:

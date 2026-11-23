@@ -21,7 +21,7 @@ from dashsplat.bootstrap import support_layout
 from dashsplat.color_match import apply_affine, match_cameras_to_front
 from dashsplat.detail_quality import detail_for_tier, effective_iterations, effective_max_splats
 from dashsplat.detect import check_event_telemetry
-from dashsplat.ego_identity import identify_ego_vehicle, load_override
+from dashsplat.ego_vehicle import export_ego_sidecar
 from dashsplat.events import DashcamEvent, scan_teslacam
 from dashsplat.frames import extract_event_frames
 from dashsplat.hw_profile import profile_for_cameras
@@ -206,21 +206,14 @@ def build_event(
                 matched = apply_affine(img, scale, bias)
                 Image.fromarray(matched).save(p, quality=92)
 
-    # --- ego paint + make/model (repeater Lab cluster + heuristics) ---
-    _emit(progress, "Identifying ego vehicle…", 0.20, stage="ego")
-    ego_frames = [
-        {"path": Path(c["file_path"]), "camera": c["camera"]}
-        for c in cameras
-        if c.get("camera") in ("left_repeater", "right_repeater", "left_pillar", "right_pillar")
-    ]
-    ego_identity = identify_ego_vehicle(
-        ego_frames,
-        cameras=list(event.cameras),
-        hw_generation=hw.generation.value,
-        override=load_override(),
-    )
-    (out_dir / "ego_identity.json").write_text(json.dumps(ego_identity.to_dict(), indent=2))
-    stage_devices["ego"] = {"device": ego_identity.device, "method": ego_identity.method}
+    # --- ego 3D proxy (path-following GLB; fills masked ego region in viewer) ---
+    _emit(progress, "Exporting ego vehicle path…", 0.20, stage="ego")
+    ego_export = export_ego_sidecar(out_dir, traj.poses, dt=0.1)
+    stage_devices["ego"] = {
+        "glb": ego_export.get("glb"),
+        "n_samples": ego_export.get("n_samples"),
+        "model_id": (ego_export.get("manifest") or {}).get("model_id"),
+    }
 
     # Distance-based selection indices into trajectory, applied as a filter on cameras list
     key_idx = select_keyframes(
@@ -361,8 +354,7 @@ def build_event(
         "eta_prior_sec": budget.eta_prior_sec,
         "hw_generation": hw.generation.value,
         "devices": stage_devices,
-        "ego_identity": ego_identity.to_dict(),
-        "ego_summary": ego_identity.summary_line(),
+        "ego_vehicle": ego_export,
     }
     (out_dir / "result.json").write_text(json.dumps(result, indent=2))
     _emit(progress, f"Done ({budget.name.value}) in {elapsed:.1f}s", 1.0, stage="done")

@@ -60,8 +60,7 @@ First launch runs `dashsplat bootstrap` into
 ## CLI
 
 ```bash
-dashsplat list <folder> [--json]          # includes ego paint/model guesses
-dashsplat ego-override --model "Model Y" --paint "Pearl White Multi-Coat"
+dashsplat list <folder> [--json]
 dashsplat build <folder> [--event ID] [--all] [--tier preview|full] [--trainer brush|msplat|seeded]
 dashsplat refine <folder> --event ID   # forces --tier full
 dashsplat bench <folder> --event ID
@@ -71,7 +70,7 @@ dashsplat bootstrap
 
 HW3 is first-class (4 cams). See [docs/HW3.md](docs/HW3.md) for cited resolution/FPS, layout, and approximate extrinsics. HW4 (6 cams with pillars) is auto-detected.
 
-Ego paint (Lab → Tesla factory colors) and soft make/model guesses from repeater views: [docs/EGO_IDENTITY.md](docs/EGO_IDENTITY.md).
+**Ego vehicle in the viewer:** a path-following low-poly sedan/crossover GLB (MIT, `viewer/assets/ego/`) sits on the SEI trajectory with a timeline scrubber and show/hide toggle. The mesh is a placeholder; a later version can swap Model 3/Y/S/X + paint via `ego_vehicle.manifest.json`. See [docs/EGO_VEHICLE.md](docs/EGO_VEHICLE.md).
 
 Exit codes: `0` ok · `2` no events · `3` no frames · `4` encrypted / blocked · `130` cancelled · other = tool failure.
 
@@ -109,9 +108,15 @@ docs/research/      Method notes (2026-11-22 / 2026-11-23)
 
 ![Splat viewer (orbit)](docs/screenshots/viewer-orbit.png)
 
-![Ego paint + model in event/library](docs/screenshots/ego-identity.png)
+![Ego car on SEI path](docs/screenshots/ego-vehicle-path.png)
 
 UI chrome matches the Tesla-style dark web tool; the viewer shot is a live WebGL orbit of a smoke-pipeline `.ply`. The unsigned `.app` zip is produced by the macOS CI job (`DashSplat-unsigned` artifact).
+
+### Third-party / bundled assets
+
+| Asset | License | Notes |
+| --- | --- | --- |
+| `viewer/assets/ego/sedan_crossover.glb` | MIT | Original DashSplat low-poly sedan/crossover placeholder — see `viewer/assets/ego/LICENSE.txt` |
 
 ## Limitations (honest v1)
 

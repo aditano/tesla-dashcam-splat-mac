@@ -10,37 +10,57 @@
     #c { width: 100%; height: 100%; display: block; cursor: grab; }
     #c:active { cursor: grabbing; }
     #hud {
-      position: absolute; left: 16px; bottom: 16px; color: #8a8a8a; font-size: 12px;
+      position: absolute; left: 16px; bottom: 72px; color: #8a8a8a; font-size: 12px;
       background: rgba(22,22,22,0.85); border: 1px solid rgba(255,255,255,0.08);
-      border-radius: 12px; padding: 10px 12px; pointer-events: none;
+      border-radius: 12px; padding: 10px 12px; pointer-events: none; max-width: 70%;
     }
+    #bar {
+      position: absolute; left: 16px; right: 16px; bottom: 16px;
+      display: flex; align-items: center; gap: 10px;
+      background: rgba(22,22,22,0.92); border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 12px; padding: 10px 12px;
+    }
+    #bar label { color: #aaa; font-size: 12px; display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+    #scrub { flex: 1; }
+    #tlabel { color: #888; font-size: 11px; font-variant-numeric: tabular-nums; min-width: 72px; text-align: right; }
     #err { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; color: #c44; }
   </style>
 </head>
 <body>
   <canvas id="c"></canvas>
   <div id="hud">Drag to orbit · Scroll to zoom</div>
+  <div id="bar">
+    <label><input type="checkbox" id="egoToggle" checked /> Ego car</label>
+    <input id="scrub" type="range" min="0" max="1000" value="0" step="1" />
+    <span id="tlabel">0.0 s</span>
+  </div>
   <div id="err"></div>
   <script>
-    // Lightweight point/splat orbit viewer. Spark can replace this later;
-    // for the Mac app we keep a self-contained WebGL2 renderer that loads
-    // ASCII XYZRGB PLY or binary 3DGS PLY (xyz + f_dc).
     const canvas = document.getElementById('c');
     const hud = document.getElementById('hud');
     const err = document.getElementById('err');
-    const gl = canvas.getContext('webgl2', { antialias: true });
-    if (!gl) {
-      err.style.display = 'flex';
-      err.textContent = 'WebGL2 required';
-    }
+    const scrub = document.getElementById('scrub');
+    const tlabel = document.getElementById('tlabel');
+    const egoToggle = document.getElementById('egoToggle');
+    const gl = canvas.getContext('webgl2', { antialias: true, depth: true });
+    if (!gl) { err.style.display = 'flex'; err.textContent = 'WebGL2 required'; }
 
     const params = new URLSearchParams(location.search);
     const plyURL = params.get('ply');
+    const egoPathURL = params.get('egoPath');
+    const egoGlbURL = params.get('egoGlb') || new URL('assets/ego/sedan_crossover.glb', location.href).href;
+    let showEgo = params.get('showEgo') !== '0';
+    egoToggle.checked = showEgo;
 
-    let yaw = 0.6, pitch = 0.35, dist = 18;
+    window.__dashsplatSetEgoVisible = (v) => {
+      showEgo = !!v;
+      egoToggle.checked = showEgo;
+    };
+    egoToggle.addEventListener('change', () => { showEgo = egoToggle.checked; });
+
+    let yaw = 0.9, pitch = 0.45, dist = 22;
     let target = [0, 0, 0];
     let dragging = false, lastX = 0, lastY = 0;
-
     canvas.addEventListener('pointerdown', e => { dragging = true; lastX = e.clientX; lastY = e.clientY; canvas.setPointerCapture(e.pointerId); });
     canvas.addEventListener('pointerup', () => dragging = false);
     canvas.addEventListener('pointermove', e => {
@@ -52,58 +72,16 @@
     });
     canvas.addEventListener('wheel', e => {
       dist *= Math.exp(e.deltaY * 0.0015);
-      dist = Math.max(1.5, Math.min(200, dist));
+      dist = Math.max(1.5, Math.min(400, dist));
       e.preventDefault();
     }, { passive: false });
 
-    const vs = `#version 300 es
-    precision highp float;
-    layout(location=0) in vec3 a_pos;
-    layout(location=1) in vec3 a_col;
-    uniform mat4 u_mvp;
-    uniform float u_point;
-    out vec3 v_col;
-    void main(){
-      v_col = a_col;
-      gl_Position = u_mvp * vec4(a_pos, 1.0);
-      gl_PointSize = u_point;
-    }`;
-    const fs = `#version 300 es
-    precision highp float;
-    in vec3 v_col;
-    out vec4 o;
-    void main(){
-      vec2 p = gl_PointCoord * 2.0 - 1.0;
-      float r = dot(p,p);
-      if(r > 1.0) discard;
-      float a = exp(-r * 2.2);
-      o = vec4(v_col, a);
-    }`;
-
-    function compile(type, src) {
-      const s = gl.createShader(type);
-      gl.shaderSource(s, src);
-      gl.compileShader(s);
-      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
-      return s;
-    }
-    const prog = gl.createProgram();
-    gl.attachShader(prog, compile(gl.VERTEX_SHADER, vs));
-    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fs));
-    gl.linkProgram(prog);
-    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
-    const uMVP = gl.getUniformLocation(prog, 'u_mvp');
-    const uPoint = gl.getUniformLocation(prog, 'u_point');
-
-    let count = 0;
-    const vao = gl.createVertexArray();
-
+    // --- math ---
     function mat4Perspective(fovy, aspect, near, far) {
       const f = 1 / Math.tan(fovy / 2);
       const m = new Float32Array(16);
       m[0] = f / aspect; m[5] = f;
-      m[10] = (far + near) / (near - far);
-      m[11] = -1;
+      m[10] = (far + near) / (near - far); m[11] = -1;
       m[14] = (2 * far * near) / (near - far);
       return m;
     }
@@ -130,6 +108,80 @@
     const dot = (a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
     const normalize = a => { const l=Math.hypot(a[0],a[1],a[2])||1; return [a[0]/l,a[1]/l,a[2]/l]; };
 
+    // ENU (e,n,u) → viewer Y-up (x=e, y=u, z=-n)
+    function enuToYUp(e, n, u) { return [e, u, -n]; }
+
+    function compile(type, src) {
+      const s = gl.createShader(type);
+      gl.shaderSource(s, src); gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+      return s;
+    }
+    function link(vsSrc, fsSrc) {
+      const p = gl.createProgram();
+      gl.attachShader(p, compile(gl.VERTEX_SHADER, vsSrc));
+      gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
+      gl.linkProgram(p);
+      if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+      return p;
+    }
+
+    const pointProg = link(`#version 300 es
+      precision highp float;
+      layout(location=0) in vec3 a_pos;
+      layout(location=1) in vec3 a_col;
+      uniform mat4 u_mvp; uniform float u_point; out vec3 v_col;
+      void main(){ v_col=a_col; gl_Position=u_mvp*vec4(a_pos,1.0); gl_PointSize=u_point; }`,
+      `#version 300 es
+      precision highp float; in vec3 v_col; out vec4 o;
+      void main(){ vec2 p=gl_PointCoord*2.0-1.0; float r=dot(p,p); if(r>1.0) discard; o=vec4(v_col, exp(-r*2.2)); }`);
+    const uPointMVP = gl.getUniformLocation(pointProg, 'u_mvp');
+    const uPointSize = gl.getUniformLocation(pointProg, 'u_point');
+
+    const meshProg = link(`#version 300 es
+      precision highp float;
+      layout(location=0) in vec3 a_pos;
+      layout(location=1) in vec3 a_nrm;
+      layout(location=2) in vec3 a_col;
+      uniform mat4 u_mvp; uniform mat4 u_model; uniform mat3 u_nmat;
+      out vec3 v_col; out vec3 v_nrm;
+      void main(){
+        v_col=a_col; v_nrm=normalize(u_nmat*a_nrm);
+        gl_Position=u_mvp*u_model*vec4(a_pos,1.0);
+      }`,
+      `#version 300 es
+      precision highp float; in vec3 v_col; in vec3 v_nrm; out vec4 o;
+      void main(){
+        vec3 L=normalize(vec3(0.35,0.9,0.25));
+        float nd=max(dot(normalize(v_nrm),L),0.0);
+        o=vec4(v_col*(0.35+0.65*nd),1.0);
+      }`);
+    const uMeshMVP = gl.getUniformLocation(meshProg, 'u_mvp');
+    const uMeshModel = gl.getUniformLocation(meshProg, 'u_model');
+    const uMeshN = gl.getUniformLocation(meshProg, 'u_nmat');
+
+    const lineProg = link(`#version 300 es
+      precision highp float; layout(location=0) in vec3 a_pos; uniform mat4 u_mvp;
+      void main(){ gl_Position=u_mvp*vec4(a_pos,1.0); }`,
+      `#version 300 es
+      precision highp float; out vec4 o; void main(){ o=vec4(0.35,0.55,0.95,0.85); }`);
+    const uLineMVP = gl.getUniformLocation(lineProg, 'u_mvp');
+
+    let pointCount = 0;
+    const pointVAO = gl.createVertexArray();
+    let pathCount = 0;
+    const pathVAO = gl.createVertexArray();
+    let carVAO = null, carIndexCount = 0, carIndexType = gl.UNSIGNED_SHORT;
+    let egoSamples = [];
+    let t0 = 0, t1 = 1;
+    let playT = 0;
+
+    scrub.addEventListener('input', () => {
+      const u = scrub.valueAsNumber / 1000;
+      playT = t0 + u * (t1 - t0);
+      tlabel.textContent = playT.toFixed(1) + ' s';
+    });
+
     function resize() {
       const dpr = Math.min(devicePixelRatio || 1, 2);
       const w = canvas.clientWidth, h = canvas.clientHeight;
@@ -140,6 +192,58 @@
     window.addEventListener('resize', resize);
     resize();
 
+    function carModelMatrix(sample) {
+      // Mesh: +Z forward, +Y up. Place in Y-up world at ENU→Y-up position.
+      // yaw_rad: ENU forward = (cos, sin, 0) in (e,n). In Y-up: (cos, 0, -sin).
+      const yaw = sample.yaw_rad;
+      // Rotate mesh +Z → world forward: angle around Y so local Z maps to (cos,0,-sin)
+      // R_y(θ): x'=x cos + z sin, z'=-x sin + z cos. For local (0,0,1) → (sin θ, 0, cos θ).
+      // Want (cos yaw, 0, -sin yaw) ⇒ sin θ = cos yaw, cos θ = -sin yaw ⇒ θ = π/2 - yaw
+      const th = Math.PI / 2 - yaw;
+      const c = Math.cos(th), s = Math.sin(th);
+      const p = sample.position_y_up || enuToYUp(sample.position[0], sample.position[1], sample.position[2] || 0);
+      // Column-major
+      return new Float32Array([
+        c, 0, -s, 0,
+        0, 1, 0, 0,
+        s, 0, c, 0,
+        p[0], p[1], p[2], 1
+      ]);
+    }
+
+    function normalMat3(m4) {
+      // Upper 3x3 of model (rotation only here)
+      return new Float32Array([m4[0], m4[1], m4[2], m4[4], m4[5], m4[6], m4[8], m4[9], m4[10]]);
+    }
+
+    function sampleAt(t) {
+      if (!egoSamples.length) return null;
+      if (t <= egoSamples[0].time_sec) return egoSamples[0];
+      if (t >= egoSamples[egoSamples.length - 1].time_sec) return egoSamples[egoSamples.length - 1];
+      for (let i = 0; i < egoSamples.length - 1; i++) {
+        const a = egoSamples[i], b = egoSamples[i + 1];
+        if (a.time_sec <= t && t <= b.time_sec) {
+          const u = (t - a.time_sec) / Math.max(b.time_sec - a.time_sec, 1e-9);
+          const pa = a.position_y_up || enuToYUp(...a.position);
+          const pb = b.position_y_up || enuToYUp(...b.position);
+          let da = b.yaw_rad - a.yaw_rad;
+          while (da > Math.PI) da -= 2 * Math.PI;
+          while (da < -Math.PI) da += 2 * Math.PI;
+          return {
+            time_sec: t,
+            position: a.position,
+            position_y_up: [
+              pa[0] + (pb[0] - pa[0]) * u,
+              pa[1] + (pb[1] - pa[1]) * u,
+              pa[2] + (pb[2] - pa[2]) * u,
+            ],
+            yaw_rad: a.yaw_rad + da * u,
+          };
+        }
+      }
+      return egoSamples[egoSamples.length - 1];
+    }
+
     function frame() {
       resize();
       const eye = [
@@ -148,18 +252,46 @@
         target[2] + dist * Math.cos(pitch) * Math.cos(yaw),
       ];
       const aspect = canvas.width / Math.max(canvas.height, 1);
-      const P = mat4Perspective(Math.PI / 3, aspect, 0.05, 500);
+      const P = mat4Perspective(Math.PI / 3, aspect, 0.05, 800);
       const V = lookAt(eye, target, [0, 1, 0]);
       const MVP = mul(P, V);
+
+      gl.enable(gl.DEPTH_TEST);
       gl.enable(gl.BLEND);
       gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
       gl.clearColor(0.04, 0.04, 0.04, 1);
       gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-      gl.useProgram(prog);
-      gl.uniformMatrix4fv(uMVP, false, MVP);
-      gl.uniform1f(uPoint, Math.max(2.0, 180 / dist));
-      gl.bindVertexArray(vao);
-      gl.drawArrays(gl.POINTS, 0, count);
+
+      // Path
+      if (pathCount > 1) {
+        gl.useProgram(lineProg);
+        gl.uniformMatrix4fv(uLineMVP, false, MVP);
+        gl.bindVertexArray(pathVAO);
+        gl.drawArrays(gl.LINE_STRIP, 0, pathCount);
+      }
+
+      // Points (after path so path shows through a bit)
+      if (pointCount > 0) {
+        gl.useProgram(pointProg);
+        gl.uniformMatrix4fv(uPointMVP, false, MVP);
+        gl.uniform1f(uPointSize, Math.max(2.0, 160 / dist));
+        gl.bindVertexArray(pointVAO);
+        gl.drawArrays(gl.POINTS, 0, pointCount);
+      }
+
+      // Ego car
+      if (showEgo && carVAO && egoSamples.length) {
+        const s = sampleAt(playT);
+        if (s) {
+          const model = carModelMatrix(s);
+          gl.useProgram(meshProg);
+          gl.uniformMatrix4fv(uMeshMVP, false, MVP);
+          gl.uniformMatrix4fv(uMeshModel, false, model);
+          gl.uniformMatrix3fv(uMeshN, false, normalMat3(model));
+          gl.bindVertexArray(carVAO);
+          gl.drawElements(gl.TRIANGLES, carIndexCount, carIndexType, 0);
+        }
+      }
       requestAnimationFrame(frame);
     }
 
@@ -182,7 +314,9 @@
         const body = full.split('end_header')[1].trim().split(/\n/);
         for (let i = 0; i < n; i++) {
           const p = body[i].trim().split(/\s+/).map(Number);
-          positions[i*3] = p[0]; positions[i*3+1] = p[1]; positions[i*3+2] = p[2];
+          // ENU (e,n,u) → Y-up
+          const e = p[0], nn = p[1], u = p[2];
+          positions[i*3] = e; positions[i*3+1] = u; positions[i*3+2] = -nn;
           if (props.includes('red')) {
             const ri = props.indexOf('red');
             colors[i*3] = p[ri]/255; colors[i*3+1] = p[ri+1]/255; colors[i*3+2] = p[ri+2]/255;
@@ -191,22 +325,19 @@
           }
         }
       } else {
-        // binary_little_endian — assume our 17-float gaussian layout or xyzrgb
-        const headerBytes = new TextEncoder().encode(textHead.slice(0, headerEnd) + 'end_header\n').length;
-        // Recompute exact header length from original bytes
         const bytes = new Uint8Array(buf);
-        let off = 0;
         const asStr = new TextDecoder().decode(bytes);
         const idx = asStr.indexOf('end_header\n');
-        off = idx >= 0 ? idx + 'end_header\n'.length : headerBytes;
+        let off = idx >= 0 ? idx + 'end_header\n'.length : 0;
         const view = new DataView(buf, off);
         const hasDC = props.includes('f_dc_0');
         const strideFloats = hasDC ? 17 : (props.includes('red') ? 6 : 3);
         for (let i = 0; i < n; i++) {
           const base = i * strideFloats * 4;
-          positions[i*3] = view.getFloat32(base, true);
-          positions[i*3+1] = view.getFloat32(base + 4, true);
-          positions[i*3+2] = view.getFloat32(base + 8, true);
+          const e = view.getFloat32(base, true);
+          const nn = view.getFloat32(base + 4, true);
+          const u = view.getFloat32(base + 8, true);
+          positions[i*3] = e; positions[i*3+1] = u; positions[i*3+2] = -nn;
           if (hasDC) {
             const sh = 0.28209479177387814;
             colors[i*3] = view.getFloat32(base + 24, true) * sh + 0.5;
@@ -217,7 +348,6 @@
           }
         }
       }
-      // Center + scale camera
       let cx=0,cy=0,cz=0;
       for (let i=0;i<n;i++){ cx+=positions[i*3]; cy+=positions[i*3+1]; cz+=positions[i*3+2]; }
       cx/=Math.max(n,1); cy/=Math.max(n,1); cz/=Math.max(n,1);
@@ -228,9 +358,8 @@
         maxR = Math.max(maxR, Math.hypot(dx,dy,dz));
       }
       dist = maxR * 2.2;
-
-      count = n;
-      gl.bindVertexArray(vao);
+      pointCount = n;
+      gl.bindVertexArray(pointVAO);
       const pb = gl.createBuffer();
       gl.bindBuffer(gl.ARRAY_BUFFER, pb);
       gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
@@ -241,18 +370,110 @@
       gl.bufferData(gl.ARRAY_BUFFER, colors, gl.STATIC_DRAW);
       gl.enableVertexAttribArray(1);
       gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
-      hud.textContent = `${n.toLocaleString()} points · drag to orbit · scroll zoom`;
+      return n;
     }
 
-    if (plyURL) {
-      loadPLY(plyURL).then(() => requestAnimationFrame(frame)).catch(e => {
+    async function loadGLB(url) {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('ego GLB ' + res.status);
+      const buf = await res.arrayBuffer();
+      const dv = new DataView(buf);
+      if (dv.getUint32(0, true) !== 0x46546C67) throw new Error('bad GLB magic');
+      let offset = 12;
+      let json = null, bin = null;
+      while (offset + 8 <= buf.byteLength) {
+        const len = dv.getUint32(offset, true); offset += 4;
+        const typ = dv.getUint32(offset, true); offset += 4;
+        const slice = buf.slice(offset, offset + len); offset += len;
+        if (typ === 0x4E4F534A) json = JSON.parse(new TextDecoder().decode(slice));
+        else if (typ === 0x004E4942) bin = slice;
+      }
+      if (!json || !bin) throw new Error('incomplete GLB');
+      const prim = json.meshes[0].primitives[0];
+      function accessorData(ai) {
+        const acc = json.accessors[ai];
+        const bv = json.bufferViews[acc.bufferView];
+        const off = (bv.byteOffset || 0) + (acc.byteOffset || 0);
+        const comps = {SCALAR:1,VEC2:2,VEC3:3,VEC4:4}[acc.type];
+        if (acc.componentType === 5126) return new Float32Array(bin, off, acc.count * comps);
+        if (acc.componentType === 5123) return new Uint16Array(bin, off, acc.count * comps);
+        if (acc.componentType === 5125) return new Uint32Array(bin, off, acc.count * comps);
+        throw new Error('unsupported componentType');
+      }
+      const pos = accessorData(prim.attributes.POSITION);
+      const nrm = accessorData(prim.attributes.NORMAL);
+      const col = accessorData(prim.attributes.COLOR_0);
+      const idx = accessorData(prim.indices);
+      carVAO = gl.createVertexArray();
+      gl.bindVertexArray(carVAO);
+      const b0 = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b0); gl.bufferData(gl.ARRAY_BUFFER, pos, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+      const b1 = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b1); gl.bufferData(gl.ARRAY_BUFFER, nrm, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+      const b2 = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b2); gl.bufferData(gl.ARRAY_BUFFER, col, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 0, 0);
+      const bi = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, bi); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+      carIndexCount = idx.length;
+      carIndexType = (idx instanceof Uint32Array) ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT;
+    }
+
+    function setPathFromSamples(samples) {
+      egoSamples = samples;
+      if (!samples.length) return;
+      t0 = samples[0].time_sec;
+      t1 = samples[samples.length - 1].time_sec;
+      playT = t0;
+      scrub.value = 0;
+      tlabel.textContent = t0.toFixed(1) + ' s';
+      const pts = new Float32Array(samples.length * 3);
+      for (let i = 0; i < samples.length; i++) {
+        const p = samples[i].position_y_up || enuToYUp(samples[i].position[0], samples[i].position[1], samples[i].position[2] || 0);
+        pts[i*3] = p[0]; pts[i*3+1] = p[1]; pts[i*3+2] = p[2];
+      }
+      pathCount = samples.length;
+      gl.bindVertexArray(pathVAO);
+      const b = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, b);
+      gl.bufferData(gl.ARRAY_BUFFER, pts, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+      // Frame camera on path if no PLY
+      if (!pointCount) {
+        let cx=0,cy=0,cz=0;
+        for (let i=0;i<pathCount;i++){ cx+=pts[i*3]; cy+=pts[i*3+1]; cz+=pts[i*3+2]; }
+        cx/=pathCount; cy/=pathCount; cz/=pathCount;
+        target = [cx, cy + 1.2, cz];
+        let maxR = 5;
+        for (let i=0;i<pathCount;i++){
+          maxR = Math.max(maxR, Math.hypot(pts[i*3]-cx, pts[i*3+1]-cy, pts[i*3+2]-cz));
+        }
+        dist = maxR * 2.5;
+      }
+    }
+
+    async function boot() {
+      try {
+        if (egoGlbURL) {
+          try { await loadGLB(egoGlbURL); } catch (e) { console.warn('ego glb', e); }
+        }
+        if (egoPathURL) {
+          const path = await (await fetch(egoPathURL)).json();
+          setPathFromSamples(path.samples || []);
+        }
+        let n = 0;
+        if (plyURL) n = await loadPLY(plyURL);
+        const bits = [];
+        if (n) bits.push(n.toLocaleString() + ' points');
+        if (egoSamples.length) bits.push('ego path ' + egoSamples.length + ' samples');
+        bits.push('scrub timeline · toggle ego car');
+        hud.textContent = bits.join(' · ');
+      } catch (e) {
         err.style.display = 'flex';
         err.textContent = String(e);
-      });
-    } else {
-      hud.textContent = 'No PLY provided';
+      }
       requestAnimationFrame(frame);
     }
+    boot();
   </script>
 </body>
 </html>
