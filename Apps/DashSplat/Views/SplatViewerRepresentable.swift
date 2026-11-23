@@ -1,9 +1,10 @@
 import SwiftUI
 import WebKit
 
-/// WKWebView host for the Spark / anti-aliased splat viewer (orbit + drag).
+/// WKWebView host for the splat viewer (orbit + ego car on SEI path).
 struct SplatViewerRepresentable: NSViewRepresentable {
     let plyURL: URL
+    var showEgoCar: Bool = true
 
     func makeNSView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
@@ -20,6 +21,8 @@ struct SplatViewerRepresentable: NSViewRepresentable {
             context.coordinator.lastPLY = plyURL
             load(webView)
         }
+        let js = "window.__dashsplatSetEgoVisible && window.__dashsplatSetEgoVisible(\(showEgoCar ? "true" : "false"))"
+        webView.evaluateJavaScript(js, completionHandler: nil)
     }
 
     func makeCoordinator() -> Coordinator {
@@ -39,10 +42,22 @@ struct SplatViewerRepresentable: NSViewRepresentable {
             webView.loadHTMLString("<html><body style='background:#0a0a0a;color:#888;font-family:sans-serif;padding:2rem'>Viewer missing</body></html>", baseURL: nil)
             return
         }
+        let jobDir = plyURL.deletingLastPathComponent()
+        let egoPath = jobDir.appendingPathComponent("ego/ego_path.json")
+        let egoGlb = jobDir.appendingPathComponent("ego/sedan_crossover.glb")
         var comps = URLComponents(url: viewer, resolvingAgainstBaseURL: false)
-        comps?.queryItems = [URLQueryItem(name: "ply", value: plyURL.absoluteString)]
+        var items = [URLQueryItem(name: "ply", value: plyURL.absoluteString)]
+        if FileManager.default.fileExists(atPath: egoPath.path) {
+            items.append(URLQueryItem(name: "egoPath", value: egoPath.absoluteString))
+        }
+        if FileManager.default.fileExists(atPath: egoGlb.path) {
+            items.append(URLQueryItem(name: "egoGlb", value: egoGlb.absoluteString))
+        }
+        items.append(URLQueryItem(name: "showEgo", value: showEgoCar ? "1" : "0"))
+        comps?.queryItems = items
+        // Allow reading the whole job directory (PLY + ego/)
         if let url = comps?.url {
-            webView.loadFileURL(url, allowingReadAccessTo: plyURL.deletingLastPathComponent())
+            webView.loadFileURL(url, allowingReadAccessTo: jobDir)
         }
     }
 

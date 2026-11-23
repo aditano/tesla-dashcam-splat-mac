@@ -1,0 +1,21 @@
+{
+  "old_max_scale_m": 0.44999998807907104,
+  "new_max_scale_m": 0.06981641799211502,
+  "old_median_min_axis_m": 0.44999998807907104,
+  "new_median_min_axis_m": 0.026569906622171402,
+  "old_laplacian_var": 77.56699644761201,
+  "new_laplacian_var": 4034.807127997821,
+  "old_skeleton_precision": 0.06891565312135704,
+  "new_skeleton_precision": 0.45930337344307476,
+  "old_psnr_proxy_db": 14.430214841999929,
+  "new_psnr_proxy_db": 18.376792434747053,
+  "sources": [
+    "https://arxiv.org/abs/2404.10484",
+    "https://arxiv.org/abs/2404.09591",
+    "https://arxiv.org/abs/2311.16493",
+    "https://arxiv.org/abs/2510.07830",
+    "https://github.com/nerfstudio-project/gsplat",
+    "https://github.com/ArthurBrussee/brush",
+    "https://github.com/R44VC0RP/dashsplat"
+  ]
+}

@@ -28,10 +28,12 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.aditano.dashsplat
         PRODUCT_NAME: DashSplat
+        PRODUCT_MODULE_NAME: DashSplat
         INFOPLIST_FILE: Apps/DashSplat/Info.plist
         GENERATE_INFOPLIST_FILE: NO
         LD_RUNPATH_SEARCH_PATHS: "@executable_path/../Frameworks"
         ENABLE_HARDENED_RUNTIME: NO
+        ENABLE_TESTABILITY: YES
     scheme:
       testTargets:
         - DashSplatTests
@@ -47,3 +49,4 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.aditano.dashsplat.tests
         GENERATE_INFOPLIST_FILE: YES
         CODE_SIGNING_ALLOWED: "NO"
+        ENABLE_TESTABILITY: YES

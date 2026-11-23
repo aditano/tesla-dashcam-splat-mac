@@ -8,50 +8,86 @@ TeslaCam folder
     ▼
 SwiftUI app (DashSplat)  ──subprocess──►  dashsplat CLI (uv Python env)
     │                                         │
-    │                                         ├─ events.py      group clips / event.json
-    │                                         ├─ sei.py         Tesla protobuf SEI
-    │                                         ├─ trajectory.py  GPS→ENU poses
-    │                                         ├─ frames.py      ffmpeg / placeholders
-    │                                         ├─ mapanything.py MLX MapAnything (Apache)
-    │                                         ├─ yolo_mask.py   motion / YOLO masks
-    │                                         └─ train_splat.py OpenSplat or seeded PLY
+    │                                         ├─ events.py         group clips / event.json
+    │                                         ├─ sei.py / detect.py  Tesla SEI + encrypted-clip check
+    │                                         ├─ trajectory.py     GPS→ENU poses
+    │                                         ├─ keyframes.py      distance keyframes, blur/turn skip
+    │                                         ├─ tiles.py          ~100 m route tiles / 20 m overlap
+    │                                         ├─ frames.py         ffmpeg + timing_offsets
+    │                                         ├─ color_match.py    per-camera affine to front
+    │                                         ├─ ego_vehicle.py    path-following GLB proxy (swap-ready)
+    │                                         ├─ masks/            ego + skyseg + RF-DETR movers
+    │                                         ├─ mapanything.py    MLX MapAnything (Apache; NC opt-in)
+    │                                         ├─ trainers/         Brush (default) | msplat | seeded
+    │                                         └─ bench.py          held-out proxy PSNR + stage timings
     ▼
 WKWebView orbit viewer  ◄── splat.ply / splat.spz + cameras.json
+Results library         ◄── jobs/<folder>/library/<event>/<preview|full>/
 ```
 
-## Trainer choice: OpenSplat
+## Trainer choice (no OpenSplat)
 
-**Chosen primary trainer:** [WebODM/OpenSplat](https://github.com/WebODM/OpenSplat) (Metal/MPS).
+OpenSplat was removed (AGPL-3.0). Trainers are pluggable via `dashsplat.trainers`:
 
-| Option | Pros | Cons |
+| Trainer | License | Role |
 | --- | --- | --- |
-| **OpenSplat** | Native Metal, `.ply` + `.spz`, COLMAP ingest, battle-tested on M1–M4 | Needs Xcode Metal toolchain; binary install |
-| gsplat-mps / mpsplat | Python-native | AGPL via OpenSplat Metal port; less maintained |
-| MetalSplat | MIT, pure Python Metal shaders | Newer; no `.spz` exporter yet |
+| **Brush** (default) | Apache-2.0 | Native Metal, image masks, splat cap |
+| **msplat** | Apache-2.0 | Speed option (Metal) |
+| **seeded** | in-repo | MapAnything-point fallback for CI / no-Metal |
 
-**Fallback:** when `opensplat` is not on `PATH`, the pipeline seeds anisotropic Gaussians from MapAnything points and writes `.ply` + a stub `.spz`. CI and first-run smoke tests always exercise this path.
+**License clarification:** [zacsmms/mpsplat](https://github.com/zacsmms/mpsplat) is **Apache-2.0**. [iffyloop/gsplat-mps](https://github.com/iffyloop/gsplat-mps) is AGPL and is **not** used.
+
+Bootstrap installs trainers into `~/Library/Application Support/DashSplat/{venv,bin}` on first run (same pattern as models).
+
+## Quality tiers (Preview → Refine)
+
+No modes picker beyond this flow:
+
+| Tier | Keyframe spacing | Cap / cam | Train iters | Splat cap | ETA prior (Max-class, estimate) |
+| --- | --- | --- | --- | --- | --- |
+| Preview | ~1 / 3 m | 60 | 2500 | 300k | ~2 min / 1-min event |
+| Full | ~1 / 1 m | 300 | 7000 | 1M | ~10–15 min / 1-min event |
+
+ETA priors are labeled estimates; base chips are slower. The UI shows stage progress + remaining-time estimate. Route tiles are ~100 m with 20 m overlap.
 
 ## MapAnything
 
-Model: [`mlx-community/map-anything-apache-fp16`](https://huggingface.co/mlx-community/map-anything-apache-fp16) (Apache-2.0) via `mlx-vlm`.
-Telemetry poses + HW3 intrinsics are passed when SEI is present; otherwise MapAnything estimates poses.
+Default: [`mlx-community/map-anything-apache-fp16`](https://huggingface.co/mlx-community/map-anything-apache-fp16) (Apache-2.0).
+
+Always passes HW3 intrinsics + SEI poses when available, 16-view windows mixing all 4 cameras, confidence filtering, per-tile init cloud. CC BY-NC weights are an **off-by-default** personal-use toggle (`--nc-mapanything`).
+
+## Masks
+
+1. Fixed per-camera HW3 ego-car masks  
+2. Sky via `skyseg-coreml` (MIT) when available; geometric fallback otherwise  
+3. Moving objects via RF-DETR (Apache-2.0); parked cars kept static  
+
+No ultralytics / AGPL YOLO.
+
+## HW3 / HW4
+
+See [HW3.md](HW3.md). Auto-detect: four cams ⇒ HW3; pillars present ⇒ HW4. Intrinsics/extrinsics in `cameras.py` are labeled approximations.
+
+## Apple Silicon acceleration
+
+`dashsplat doctor` reports chip, RAM (`hw.memsize`), MLX device, Core ML compute units (`all` = ANE+GPU), Metal, VideoToolbox. Decode prefers `ffmpeg -hwaccel videotoolbox` with parallel cameras; MapAnything windows scale with RAM; trainers prefer Metal (seeded CPU fallback is logged, not silent). Stage devices are written to `devices.json` / bench.
 
 ## First-run bootstrap
 
-`dashsplat bootstrap` (also triggered by the app) creates:
+`dashsplat bootstrap` creates:
 
-`~/Library/Application Support/DashSplat/{venv,models,cache,jobs}`
+`~/Library/Application Support/DashSplat/{venv,models,cache,jobs,bin}`
 
-## Expected runtime (Apple Silicon)
+## Expected runtime (Apple Silicon) — estimates only
 
-Rough guide for a ~60–120 s four-camera event on M2/M3 Pro:
+Targets for a ~1-minute four-camera event on an **M-series Max** (base chips slower):
 
-| Stage | Time |
-| --- | --- |
-| SEI + frame extract | 5–20 s |
-| MapAnything (4–24 views) | 2–15 s |
-| YOLO / motion mask | 5–30 s |
-| OpenSplat 1.5–3k iters | 2–8 min |
-| Seeded fallback only | &lt; 10 s |
+| Stage | Preview (est.) | Full (est.) |
+| --- | --- | --- |
+| Ingest + keyframes | seconds | seconds |
+| Masks | seconds | tens of seconds |
+| MapAnything | tens of seconds | tens of seconds |
+| Train (Brush/msplat) | ~1–2 min total pipeline | ~10–15 min total pipeline |
+| Seeded fallback only | &lt; 10 s | &lt; 10 s |
 
-Longer SavedClips (multi-minute stitches) scale roughly linearly with selected frames.
+Numbers above are **estimates** from the 2026-11-23 research note, not measured CI timings. Use `dashsplat bench <folder> --event ID` for measured stage timings + held-out proxy PSNR.

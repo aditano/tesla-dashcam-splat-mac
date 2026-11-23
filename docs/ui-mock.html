@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>DashSplat UI Mock</title>
+  <title>DashSplat UI Mock — Preview / Refine</title>
   <style>
     :root {
       --bg: #0a0a0a;
@@ -11,7 +11,8 @@
       --text: #f2f2f2;
       --muted: #8a8a8a;
       --accent: #3e6ae1;
-      --font: "SF Pro Display", "Inter", "Segoe UI", system-ui, sans-serif;
+      --warn: #f28c33;
+      --font: "SF Pro Display", "Segoe UI", system-ui, sans-serif;
     }
     * { box-sizing: border-box; }
     body {
@@ -20,19 +21,19 @@
       padding: 24px;
     }
     .window {
-      width: 1280px; height: 800px; display: grid; grid-template-columns: 360px 1fr;
+      width: 1280px; height: 820px; display: grid; grid-template-columns: 380px 1fr;
       background: var(--bg); border-radius: 14px; overflow: hidden;
       box-shadow: 0 30px 80px rgba(0,0,0,0.55); border: 1px solid var(--line);
     }
     .side {
       background: rgba(22,22,22,0.95); border-right: 1px solid var(--line);
-      padding: 18px; display: flex; flex-direction: column; gap: 16px;
+      padding: 18px; display: flex; flex-direction: column; gap: 14px;
     }
     .brand h1 { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: -0.03em; }
     .brand p { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
     .drop {
       border: 1.5px dashed rgba(255,255,255,0.14); border-radius: 16px;
-      padding: 28px 12px; text-align: center; background: rgba(255,255,255,0.02);
+      padding: 22px 12px; text-align: center; background: rgba(255,255,255,0.02);
     }
     .drop .icon { color: var(--accent); font-size: 28px; margin-bottom: 8px; }
     .drop .title { font-size: 14px; font-weight: 500; }
@@ -41,7 +42,9 @@
       display: inline-block; margin-top: 12px; padding: 10px 14px; border-radius: 12px;
       background: rgba(255,255,255,0.06); font-size: 13px; font-weight: 600;
     }
-    .btn.primary { background: var(--accent); width: 100%; text-align: center; }
+    .btn.primary { background: var(--accent); text-align: center; }
+    .btn.row { flex: 1; text-align: center; margin-top: 0; }
+    .btn-row { display: flex; gap: 10px; }
     .sec { font-size: 11px; font-weight: 600; letter-spacing: 0.12em; color: var(--muted); }
     .event {
       display: flex; gap: 10px; padding: 12px; border-radius: 12px;
@@ -51,7 +54,18 @@
     .check { color: var(--accent); }
     .event .label { font-size: 13px; font-weight: 500; }
     .event .meta { font-size: 11px; color: var(--muted); margin-top: 4px; }
+    .lib-item {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 8px; border-radius: 8px; background: rgba(255,255,255,0.04); margin-top: 6px;
+      font-size: 12px;
+    }
+    .lib-item .meta { font-size: 10px; color: var(--muted); margin-top: 2px; }
     .status { font-size: 11px; color: var(--muted); }
+    .stage { font-size: 10px; font-weight: 600; letter-spacing: 0.1em; color: #666; margin-top: 4px; }
+    .warn {
+      font-size: 11px; color: var(--warn); padding: 10px; border-radius: 10px;
+      background: rgba(242,140,51,0.12);
+    }
     .main {
       position: relative;
       background: linear-gradient(135deg, #0f1217, #080808);
@@ -87,7 +101,8 @@
       border-radius: 12px; padding: 10px 12px;
     }
     .progress { height: 4px; background: rgba(255,255,255,0.08); border-radius: 99px; overflow: hidden; margin: 8px 0 12px; }
-    .progress > span { display: block; width: 72%; height: 100%; background: var(--accent); }
+    .progress > span { display: block; width: 62%; height: 100%; background: var(--accent); }
+    .eta { float: right; font-variant-numeric: tabular-nums; }
   </style>
 </head>
 <body>
@@ -103,13 +118,14 @@
         <div class="sub">SavedClips · SentryClips · RecentClips · MP4s</div>
         <div class="btn">Choose Folder…</div>
       </div>
+      <div class="warn">No SEI telemetry found (needs firmware 2025.44.25+). Poses will fall back to MapAnything estimates — quality will be lower.</div>
       <div>
         <div class="sec">EVENTS</div>
         <div class="event">
           <div class="check">●</div>
           <div>
             <div class="label">2025-11-20 14:03:12</div>
-            <div class="meta">120s · back, front, left_repeater, right_repeater</div>
+            <div class="meta">60s · front, back, left_repeater, right_repeater</div>
             <div class="meta">Palo Alto</div>
           </div>
         </div>
@@ -122,17 +138,38 @@
           </div>
         </div>
       </div>
+      <div>
+        <div class="sec">RESULTS LIBRARY</div>
+        <div class="lib-item">
+          <div>
+            <div>2025-11-20 14:03:12</div>
+            <div class="meta">Preview · brush · 284k gs</div>
+          </div>
+          <div>›</div>
+        </div>
+        <div class="lib-item">
+          <div>
+            <div>2025-11-20 14:03:12</div>
+            <div class="meta">Full · brush · 910k gs</div>
+          </div>
+          <div>›</div>
+        </div>
+      </div>
       <div style="margin-top:auto">
-        <div class="status">Training with OpenSplat (Metal/MPS)…</div>
+        <div class="status">Training splat (preview, 2500 iters)… <span class="eta">~48s left</span></div>
+        <div class="stage">TRAIN</div>
         <div class="progress"><span></span></div>
-        <div class="btn primary">Build Splat</div>
-        <div class="status" style="margin-top:10px">Ready · Apple Silicon</div>
+        <div class="btn-row">
+          <div class="btn primary row">Preview</div>
+          <div class="btn row">Refine to full</div>
+        </div>
+        <div class="status" style="margin-top:10px">Preview done · Refine available · estimate ~10–15 min Full (Max-class)</div>
       </div>
     </aside>
     <main class="main">
       <div class="viewer-card">
         <div class="points"></div>
-        <div class="hud">84,210 points · drag to orbit · scroll zoom</div>
+        <div class="hud">Preview · 284,210 Gaussians · drag to orbit · scroll zoom</div>
       </div>
     </main>
   </div>

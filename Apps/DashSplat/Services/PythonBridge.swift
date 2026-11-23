@@ -4,6 +4,7 @@ struct BuildResult {
     var ok: Bool
     var exitCode: Int
     var plyURL: URL?
+    var warning: String?
 }
 
 enum PythonBridgeError: Error, LocalizedError {
@@ -32,8 +33,6 @@ final class PythonBridge {
         let home = FileManager.default.homeDirectoryForCurrentUser
         supportDir = home
             .appendingPathComponent("Library/Application Support/DashSplat", isDirectory: true)
-        // Bundled python package lives next to the app resources when packaged;
-        // during dev, fall back to repo-relative path via env or sibling search.
         if let bundled = Bundle.main.resourceURL?.appendingPathComponent("python") {
             repoPython = bundled
         } else {
@@ -54,7 +53,6 @@ final class PythonBridge {
         if FileManager.default.isExecutableFile(atPath: venvPython.path) {
             return venvPython
         }
-        // Dev fallback
         let candidates = ["/usr/bin/python3", "/opt/homebrew/bin/python3"]
         for c in candidates where FileManager.default.isExecutableFile(atPath: c) {
             return URL(fileURLWithPath: c)
@@ -77,7 +75,6 @@ final class PythonBridge {
             "-m", "dashsplat.cli", "bootstrap",
             "--support-dir", supportDir.path,
         ]
-        // First bootstrap may use system python to install into venv
         return try await run(
             executable: py,
             arguments: args,
@@ -86,7 +83,7 @@ final class PythonBridge {
                 "PYTHONPATH": repoPython.path,
                 "DASHSPLAT_SUPPORT_DIR": supportDir.path,
             ],
-            onProgress: onProgress
+            onProgress: { msg, frac, _, _ in onProgress(msg, frac) }
         ).exitCode
     }
 
@@ -97,7 +94,7 @@ final class PythonBridge {
             arguments: ["-m", "dashsplat.cli", "list", folder.path, "--json"],
             cwd: repoPython,
             env: defaultEnv(),
-            onProgress: { _, _ in }
+            onProgress: { _, _, _, _ in }
         )
         guard result.exitCode == 0 else {
             throw PythonBridgeError.processFailed(result.exitCode, result.stderr)
@@ -106,7 +103,6 @@ final class PythonBridge {
         do {
             return try JSONDecoder().decode([DashcamEventDTO].self, from: data)
         } catch {
-            // list --json prints only the array; if mixed with progress, extract last array
             if let start = result.stdout.firstIndex(of: "["),
                let end = result.stdout.lastIndex(of: "]") {
                 let slice = String(result.stdout[start...end])
@@ -119,10 +115,42 @@ final class PythonBridge {
         }
     }
 
+    func loadLibrary(folder: URL) async throws -> [LibraryItem] {
+        let out = supportDir.appendingPathComponent("jobs/\(folder.lastPathComponent)/library.json")
+        guard FileManager.default.fileExists(atPath: out.path) else { return [] }
+        let data = try Data(contentsOf: out)
+        // Pipeline writes full result.json objects; map to LibraryItem
+        struct Raw: Codable {
+            var event_id: String?
+            var label: String?
+            var tier: String?
+            var ply: String?
+            var trainer: String?
+            var elapsed_sec: Double?
+            var num_gaussians: Int?
+            var warning: String?
+        }
+        let raw = try JSONDecoder().decode([Raw].self, from: data)
+        return raw.compactMap { r in
+            guard let eid = r.event_id, let tier = r.tier else { return nil }
+            return LibraryItem(
+                event_id: eid,
+                label: r.label,
+                tier: tier,
+                ply: r.ply,
+                trainer: r.trainer,
+                elapsed_sec: r.elapsed_sec,
+                num_gaussians: r.num_gaussians,
+                warning: r.warning
+            )
+        }
+    }
+
     func build(
         folder: URL,
         eventIDs: [String],
-        onProgress: @escaping (String, Double) -> Void
+        tier: String,
+        onProgress: @escaping (String, Double, String?, Double?) -> Void
     ) async throws -> BuildResult {
         let py = try requirePython()
         let out = supportDir.appendingPathComponent("jobs/\(folder.lastPathComponent)", isDirectory: true)
@@ -133,9 +161,15 @@ final class PythonBridge {
         var args = [
             "-m", "dashsplat.cli", "build", folder.path,
             "--out", out.path,
-            "--force-fallback-trainer",
-            "--no-mlx",
+            "--tier", tier,
         ]
+        // Prefer Brush/msplat on device; seeded only when explicitly forced via env
+        if ProcessInfo.processInfo.environment["DASHSPLAT_FORCE_SEEDED"] == "1" {
+            args.append(contentsOf: ["--force-fallback-trainer", "--trainer", "seeded"])
+        }
+        if ProcessInfo.processInfo.environment["DASHSPLAT_NO_MLX"] == "1" {
+            args.append("--no-mlx")
+        }
         for id in eventIDs {
             args.append(contentsOf: ["--event", id])
         }
@@ -148,13 +182,32 @@ final class PythonBridge {
             onProgress: onProgress
         )
         var ply: URL?
+        var warning: String?
         if let first = eventIDs.first {
-            let candidate = out.appendingPathComponent("\(first)/splat.ply")
+            let candidate = out
+                .appendingPathComponent("library/\(first.replacingOccurrences(of: "/", with: "_"))/\(tier)/splat.ply")
             if FileManager.default.fileExists(atPath: candidate.path) {
                 ply = candidate
             }
+            let resultJSON = candidate.deletingLastPathComponent().appendingPathComponent("result.json")
+            if let data = try? Data(contentsOf: resultJSON),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                warning = obj["warning"] as? String
+                if ply == nil, let p = obj["ply"] as? String {
+                    ply = URL(fileURLWithPath: p)
+                }
+            }
         }
-        return BuildResult(ok: proc.exitCode == 0, exitCode: proc.exitCode, plyURL: ply)
+        // Scan stdout for encrypted / health messages
+        for line in proc.stdout.split(whereSeparator: \.isNewline) {
+            if let data = String(line).data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let msg = obj["message"] as? String,
+               msg.lowercased().contains("encrypt") || msg.lowercased().contains("no sei") {
+                warning = msg
+            }
+        }
+        return BuildResult(ok: proc.exitCode == 0, exitCode: proc.exitCode, plyURL: ply, warning: warning)
     }
 
     private func requirePython() throws -> URL {
@@ -181,7 +234,7 @@ final class PythonBridge {
         arguments: [String],
         cwd: URL,
         env: [String: String],
-        onProgress: @escaping (String, Double) -> Void
+        onProgress: @escaping (String, Double, String?, Double?) -> Void
     ) async throws -> ProcResult {
         try await withCheckedThrowingContinuation { continuation in
             let process = Process()
@@ -205,7 +258,7 @@ final class PythonBridge {
                 stdoutBox += chunk
                 for line in chunk.split(whereSeparator: \.isNewline) {
                     if let parsed = Self.parseProgressLine(String(line)) {
-                        onProgress(parsed.0, parsed.1)
+                        onProgress(parsed.message, parsed.fraction, parsed.stage, parsed.etaSec)
                     }
                 }
             }
@@ -236,20 +289,36 @@ final class PythonBridge {
         }
     }
 
-    private static func parseProgressLine(_ line: String) -> (String, Double)? {
+    private struct ProgressParsed {
+        var message: String
+        var fraction: Double
+        var stage: String?
+        var etaSec: Double?
+    }
+
+    private static func parseProgressLine(_ line: String) -> ProgressParsed? {
         guard line.contains("\"type\""), let data = line.data(using: .utf8) else { return nil }
         guard
             let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let type = obj["type"] as? String
         else { return nil }
-        if type == "progress",
-           let message = obj["message"] as? String {
+        if type == "progress" {
+            let message = (obj["message"] as? String) ?? ""
             let frac = (obj["fraction"] as? Double) ?? 0
-            return (message, frac)
+            let stage = obj["stage"] as? String
+            let eta = obj["eta_sec"] as? Double
+            return ProgressParsed(message: message, fraction: frac, stage: stage, etaSec: eta)
         }
         if type == "batch_progress" {
             let frac = (obj["fraction"] as? Double) ?? 0
-            return ("Batch progress", frac)
+            let index = (obj["index"] as? Int).map { $0 + 1 } ?? 0
+            let total = obj["total"] as? Int ?? 0
+            return ProgressParsed(
+                message: "Batch \(index)/\(total)",
+                fraction: frac,
+                stage: "batch",
+                etaSec: nil
+            )
         }
         return nil
     }

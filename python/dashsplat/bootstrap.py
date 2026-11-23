@@ -1,4 +1,4 @@
-"""First-run dependency + model install into Application Support."""
+"""First-run dependency + model + trainer install into Application Support."""
 
 from __future__ import annotations
 
@@ -35,6 +35,7 @@ def support_layout(root: Path | None = None) -> dict[str, Path]:
         "models": root / "models",
         "cache": root / "cache",
         "jobs": root / "jobs",
+        "bin": root / "bin",
         "marker": root / ".bootstrap_ok",
     }
 
@@ -50,15 +51,48 @@ def ensure_uv() -> str:
     uv = shutil.which("uv")
     if uv:
         return uv
-    # Install uv via official installer script when missing
     subprocess.run(
-        [sys.executable, "-c", "import urllib.request; urllib.request.urlretrieve('https://astral.sh/uv/install.sh', '/tmp/uv-install.sh')"],
+        [
+            sys.executable,
+            "-c",
+            "import urllib.request; urllib.request.urlretrieve('https://astral.sh/uv/install.sh', '/tmp/uv-install.sh')",
+        ],
         check=False,
     )
     if Path("/tmp/uv-install.sh").exists():
         subprocess.run(["sh", "/tmp/uv-install.sh"], check=False)
-    uv = shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
-    return uv
+    return shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
+
+
+def _install_trainers(py: Path, bin_dir: Path, report: Callable[[str, float], None]) -> dict:
+    """Install msplat via pip; attempt Brush binary into Application Support/bin."""
+    info: dict = {"msplat": False, "brush": False}
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    report("Installing msplat (Apache-2.0 Metal trainer)…", 0.78)
+    code = _run([str(py), "-m", "pip", "install", "msplat"])
+    info["msplat"] = code == 0
+    # Brush: look for existing, else note download URL for Apple Silicon release
+    import shutil
+
+    brush = shutil.which("brush")
+    if brush:
+        dest = bin_dir / "brush"
+        try:
+            if not dest.exists():
+                shutil.copy2(brush, dest)
+                dest.chmod(0o755)
+            info["brush"] = True
+        except OSError:
+            info["brush"] = True  # still on PATH
+            info["brush_path"] = brush
+    else:
+        info["brush"] = False
+        info["brush_hint"] = (
+            "Download the Apple Silicon Brush release from "
+            "https://github.com/ArthurBrussee/brush/releases and place it at "
+            f"{bin_dir / 'brush'} (or set DASHSPLAT_BRUSH)."
+        )
+    return info
 
 
 def bootstrap(
@@ -66,11 +100,12 @@ def bootstrap(
     support_dir: Path | None = None,
     with_mlx: bool = True,
     download_model: bool = True,
+    with_trainers: bool = True,
     progress: ProgressCb | None = None,
 ) -> dict:
-    """Install Python deps + optionally download MapAnything weights. Idempotent."""
+    """Install Python deps, trainers, and optionally MapAnything weights. Idempotent."""
     paths = support_layout(support_dir)
-    for key in ("root", "models", "cache", "jobs"):
+    for key in ("root", "models", "cache", "jobs", "bin"):
         paths[key].mkdir(parents=True, exist_ok=True)
 
     def report(msg: str, frac: float) -> None:
@@ -88,21 +123,19 @@ def bootstrap(
 
     py = venv / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
     report("Installing dashsplat package…", 0.35)
-    # Install this package editable from repo when available
     pkg_root = Path(__file__).resolve().parents[1]
     extras = "dev"
     if with_mlx and sys.platform == "darwin":
         extras = "dev,mlx"
     code = _run([uv, "pip", "install", "--python", str(py), "-e", f"{pkg_root}[{extras}]"])
     if code != 0:
-        # Retry without mlx extras
         code = _run([uv, "pip", "install", "--python", str(py), "-e", f"{pkg_root}[dev]"])
         if code != 0:
             return {"ok": False, "exit_code": code, "step": "pip"}
 
     model_path = paths["models"] / "map-anything-apache-fp16"
     if download_model and with_mlx and sys.platform == "darwin":
-        report(f"Downloading {MAPANYTHING_REPO}…", 0.6)
+        report(f"Downloading {MAPANYTHING_REPO}…", 0.55)
         try:
             code = _run(
                 [
@@ -117,16 +150,24 @@ def bootstrap(
         except Exception:
             code = 1
         if code != 0:
-            report("Model download skipped/failed (will retry on first build)", 0.75)
+            report("Model download skipped/failed (will retry on first build)", 0.7)
     else:
         report("Skipping MapAnything download (non-Mac or --no-model)", 0.7)
 
+    trainer_info: dict = {}
+    if with_trainers:
+        trainer_info = _install_trainers(py, paths["bin"], report)
+    else:
+        report("Skipping trainer install", 0.85)
+
     marker = {
-        "version": "0.1.0",
+        "version": "1.0.0",
         "venv": str(venv),
         "python": str(py),
         "model_dir": str(model_path),
         "mapanything_repo": MAPANYTHING_REPO,
+        "trainers": trainer_info,
+        "default_trainer": "brush",
     }
     paths["marker"].write_text(json.dumps(marker, indent=2))
     report("Bootstrap complete", 1.0)

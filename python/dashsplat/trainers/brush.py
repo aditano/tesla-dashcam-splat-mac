@@ -1,0 +1,120 @@
+"""Brush trainer (Apache-2.0) — default Mac Metal trainer.
+
+Brush CLI: https://github.com/ArthurBrussee/brush
+Supports COLMAP / Nerfstudio datasets, a `masks/` folder (black=ignore),
+and MCMC-like training with a max splat cap.
+
+Full-tier defaults enable MCMC densification, scale/opacity controls, and AA
+when the installed Brush build understands the flags (best-effort).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+from pathlib import Path
+
+from dashsplat.bootstrap import support_layout
+from dashsplat.trainers.base import ProgressCb, TrainerConfig, TrainResult
+
+
+def find_brush() -> Path | None:
+    env = os.environ.get("DASHSPLAT_BRUSH")
+    if env and Path(env).exists():
+        return Path(env)
+    which = shutil.which("brush")
+    if which:
+        return Path(which)
+    cand = support_layout()["root"] / "bin" / "brush"
+    if cand.exists():
+        return cand
+    return None
+
+
+def _detail_flags(config: TrainerConfig) -> list[str]:
+    """Best-effort CLI flags for thin-structure Full defaults."""
+    d = config.detail or {}
+    flags: list[str] = []
+    if d.get("mcmc") or d.get("densify") == "mcmc":
+        flags += ["--mcmc"]
+    if d.get("max_scale") is not None:
+        flags += ["--max-scale", str(d["max_scale"])]
+    if d.get("antialias"):
+        flags += ["--antialias"]
+    if d.get("opacity_reset_every"):
+        flags += ["--opacity-reset-every", str(int(d["opacity_reset_every"]))]
+    if d.get("absgrad"):
+        flags += ["--absgrad"]
+    return flags
+
+
+class BrushTrainer:
+    name = "brush"
+
+    def is_available(self) -> bool:
+        return find_brush() is not None
+
+    def train(
+        self,
+        project_dir: Path,
+        out_dir: Path,
+        *,
+        config: TrainerConfig,
+        progress: ProgressCb | None = None,
+    ) -> TrainResult:
+        brush = find_brush()
+        if not brush:
+            raise RuntimeError("brush binary not found")
+        if progress:
+            progress("Training with Brush (Metal, detail defaults)…", 0.4)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ply = out_dir / "splat.ply"
+        # Persist detail config beside the project for reproducibility
+        detail_path = out_dir / "trainer_detail.json"
+        detail_path.write_text(json.dumps(config.detail or {}, indent=2))
+
+        cmd = [
+            str(brush),
+            str(project_dir),
+            "--export-path",
+            str(ply),
+            "--total-steps",
+            str(config.iterations),
+            "--max-splats",
+            str(config.max_splats),
+        ]
+        cmd += _detail_flags(config)
+        if config.masks_dir and config.masks_dir.exists():
+            dest = project_dir / "masks"
+            if not dest.exists():
+                shutil.copytree(config.masks_dir, dest, dirs_exist_ok=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            # Retry without experimental flags for older Brush builds
+            cmd2 = [
+                str(brush),
+                str(project_dir),
+                "--export-path",
+                str(ply),
+                "--total-steps",
+                str(config.iterations),
+                "--max-splats",
+                str(config.max_splats),
+            ]
+            proc = subprocess.run(cmd2, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(f"Brush failed ({proc.returncode}): {proc.stderr[-2000:]}")
+        if progress:
+            progress("Brush finished", 0.95)
+        spz = ply.with_suffix(".spz")
+        return TrainResult(
+            trainer=self.name,
+            ply=str(ply),
+            spz=str(spz) if spz.exists() else None,
+            cameras=str(out_dir / "cameras.json") if (out_dir / "cameras.json").exists() else None,
+            exit_code=proc.returncode,
+            log=proc.stdout[-2000:] if proc.stdout else None,
+            meta={"detail": config.detail},
+        )
