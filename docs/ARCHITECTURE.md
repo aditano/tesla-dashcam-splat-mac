@@ -15,6 +15,7 @@ SwiftUI app (DashSplat)  ──subprocess──►  dashsplat CLI (uv Python env
     │                                         ├─ tiles.py          ~100 m route tiles / 20 m overlap
     │                                         ├─ frames.py         ffmpeg + timing_offsets
     │                                         ├─ color_match.py    per-camera affine to front
+    │                                         ├─ ego_identity.py   paint (Lab→Tesla factory) + model guesses
     │                                         ├─ masks/            ego + skyseg + RF-DETR movers
     │                                         ├─ mapanything.py    MLX MapAnything (Apache; NC opt-in)
     │                                         ├─ trainers/         Brush (default) | msplat | seeded

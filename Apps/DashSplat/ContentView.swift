@@ -5,6 +5,9 @@ import UniformTypeIdentifiers
 struct ContentView: View {
     @EnvironmentObject private var model: AppModel
     @State private var isDropTargeted = false
+    @State private var showEgoOverride = false
+    @State private var overrideModel = "Model Y"
+    @State private var overridePaint = "Pearl White Multi-Coat"
 
     var body: some View {
         HStack(spacing: 0) {
@@ -17,6 +20,39 @@ struct ContentView: View {
         .preferredColorScheme(.dark)
         .task {
             await model.ensureBootstrap()
+        }
+        .sheet(isPresented: $showEgoOverride) {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Your car")
+                    .font(.system(size: 18, weight: .semibold))
+                TextField("Model (e.g. Model Y)", text: $overrideModel)
+                    .textFieldStyle(.roundedBorder)
+                TextField("Paint name", text: $overridePaint)
+                    .textFieldStyle(.roundedBorder)
+                HStack {
+                    Button("Clear") {
+                        Task {
+                            await model.clearEgoOverride()
+                            showEgoOverride = false
+                        }
+                    }
+                    Spacer()
+                    Button("Cancel") { showEgoOverride = false }
+                    Button("Save") {
+                        Task {
+                            await model.applyEgoOverride(
+                                model: overrideModel,
+                                paintName: overridePaint,
+                                paintCode: nil
+                            )
+                            showEgoOverride = false
+                        }
+                    }
+                    .keyboardShortcut(.defaultAction)
+                }
+            }
+            .padding(20)
+            .frame(width: 360)
         }
     }
 
@@ -67,6 +103,19 @@ struct ContentView: View {
                                 ) {
                                     model.toggleSelection(event.id)
                                 }
+                            }
+                            if let first = model.events.first, first.ego_summary != nil {
+                                Button("Override your car…") {
+                                    if let paint = first.ego_identity?.paint?.name {
+                                        overridePaint = paint
+                                    }
+                                    if let m = first.ego_identity?.model_guesses?.first?.model {
+                                        overrideModel = m
+                                    }
+                                    showEgoOverride = true
+                                }
+                                .font(.system(size: 12))
+                                .foregroundStyle(Color(white: 0.55))
                             }
                         }
                     }
@@ -275,6 +324,12 @@ struct LibraryRow: View {
                     Text("\(item.tier.capitalized) · \(item.trainer ?? "?") · \(item.num_gaussians.map { "\($0) gs" } ?? "")")
                         .font(.system(size: 10))
                         .foregroundStyle(Color(white: 0.45))
+                    if let ego = item.ego_summary {
+                        Text(ego)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(Color(red: 0.55, green: 0.72, blue: 0.95))
+                            .lineLimit(1)
+                    }
                 }
                 Spacer()
                 Image(systemName: "chevron.right")
@@ -318,6 +373,11 @@ struct EventRow: View {
                         Text(loc)
                             .font(.system(size: 11))
                             .foregroundStyle(Color(white: 0.45))
+                    }
+                    if let ego = event.ego_summary {
+                        Text(ego)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(Color(red: 0.55, green: 0.72, blue: 0.95))
                     }
                 }
                 Spacer(minLength: 0)

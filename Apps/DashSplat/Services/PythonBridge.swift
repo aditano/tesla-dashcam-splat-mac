@@ -87,6 +87,38 @@ final class PythonBridge {
         ).exitCode
     }
 
+    func setEgoOverride(model: String?, paintName: String?, paintCode: String?) async throws {
+        let py = try requirePython()
+        var args = ["-m", "dashsplat.cli", "ego-override"]
+        if let model, !model.isEmpty { args += ["--model", model] }
+        if let paintName, !paintName.isEmpty { args += ["--paint", paintName] }
+        if let paintCode, !paintCode.isEmpty { args += ["--paint-code", paintCode] }
+        let result = try await run(
+            executable: py,
+            arguments: args,
+            cwd: repoPython,
+            env: defaultEnv(),
+            onProgress: { _, _, _, _ in }
+        )
+        guard result.exitCode == 0 else {
+            throw PythonBridgeError.processFailed(result.exitCode, result.stderr)
+        }
+    }
+
+    func clearEgoOverride() async throws {
+        let py = try requirePython()
+        let result = try await run(
+            executable: py,
+            arguments: ["-m", "dashsplat.cli", "ego-override", "--clear"],
+            cwd: repoPython,
+            env: defaultEnv(),
+            onProgress: { _, _, _, _ in }
+        )
+        guard result.exitCode == 0 else {
+            throw PythonBridgeError.processFailed(result.exitCode, result.stderr)
+        }
+    }
+
     func listEvents(folder: URL) async throws -> [DashcamEventDTO] {
         let py = try requirePython()
         let result = try await run(
@@ -129,6 +161,7 @@ final class PythonBridge {
             var elapsed_sec: Double?
             var num_gaussians: Int?
             var warning: String?
+            var ego_summary: String?
         }
         let raw = try JSONDecoder().decode([Raw].self, from: data)
         return raw.compactMap { r in
@@ -141,7 +174,8 @@ final class PythonBridge {
                 trainer: r.trainer,
                 elapsed_sec: r.elapsed_sec,
                 num_gaussians: r.num_gaussians,
-                warning: r.warning
+                warning: r.warning,
+                ego_summary: r.ego_summary
             )
         }
     }

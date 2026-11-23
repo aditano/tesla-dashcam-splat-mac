@@ -43,11 +43,44 @@ EGO_POLYGONS: dict[CameraId, list[list[tuple[float, float]]]] = {
 }
 
 
-def ego_mask_array(camera: CameraId, width: int, height: int) -> np.ndarray:
-    """Return HxW uint8 mask: 255=keep, 0=ego (ignore)."""
+def _scale_polygons_for_model(
+    polys: list[list[tuple[float, float]]],
+    model: str | None,
+) -> list[list[tuple[float, float]]]:
+    """Slightly expand ego body coverage for taller vehicles when user override says so."""
+    if not model:
+        return polys
+    m = model.lower()
+    # Model Y / X / Juniper: pull top of body polygon slightly higher in frame
+    lift = 0.0
+    if "model y" in m or "juniper" in m:
+        lift = 0.04
+    elif "model x" in m:
+        lift = 0.05
+    if lift <= 0:
+        return polys
+    out: list[list[tuple[float, float]]] = []
+    for poly in polys:
+        out.append([(x, max(0.0, y - lift)) for x, y in poly])
+    return out
+
+
+def ego_mask_array(
+    camera: CameraId,
+    width: int,
+    height: int,
+    *,
+    model: str | None = None,
+) -> np.ndarray:
+    """Return HxW uint8 mask: 255=keep, 0=ego (ignore).
+
+    Optional ``model`` (from ego identity override) expands the body region for
+    taller vehicles so the ego profile matches the owner's car.
+    """
     img = Image.new("L", (width, height), 255)
     draw = ImageDraw.Draw(img)
-    for poly in EGO_POLYGONS.get(camera, []):
+    polys = _scale_polygons_for_model(list(EGO_POLYGONS.get(camera, [])), model)
+    for poly in polys:
         pts = [(x * width, y * height) for x, y in poly]
         draw.polygon(pts, fill=0)
     return np.asarray(img, dtype=np.uint8)

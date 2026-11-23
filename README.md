@@ -60,7 +60,8 @@ First launch runs `dashsplat bootstrap` into
 ## CLI
 
 ```bash
-dashsplat list <folder> [--json]
+dashsplat list <folder> [--json]          # includes ego paint/model guesses
+dashsplat ego-override --model "Model Y" --paint "Pearl White Multi-Coat"
 dashsplat build <folder> [--event ID] [--all] [--tier preview|full] [--trainer brush|msplat|seeded]
 dashsplat refine <folder> --event ID   # forces --tier full
 dashsplat bench <folder> --event ID
@@ -69,6 +70,8 @@ dashsplat bootstrap
 ```
 
 HW3 is first-class (4 cams). See [docs/HW3.md](docs/HW3.md) for cited resolution/FPS, layout, and approximate extrinsics. HW4 (6 cams with pillars) is auto-detected.
+
+Ego paint (Lab → Tesla factory colors) and soft make/model guesses from repeater views: [docs/EGO_IDENTITY.md](docs/EGO_IDENTITY.md).
 
 Exit codes: `0` ok · `2` no events · `3` no frames · `4` encrypted / blocked · `130` cancelled · other = tool failure.
 
@@ -105,6 +108,8 @@ docs/research/      Method notes (2026-11-22 / 2026-11-23)
 ![Results library](docs/screenshots/app-library.png)
 
 ![Splat viewer (orbit)](docs/screenshots/viewer-orbit.png)
+
+![Ego paint + model in event/library](docs/screenshots/ego-identity.png)
 
 UI chrome matches the Tesla-style dark web tool; the viewer shot is a live WebGL orbit of a smoke-pipeline `.ply`. The unsigned `.app` zip is produced by the macOS CI job (`DashSplat-unsigned` artifact).
 

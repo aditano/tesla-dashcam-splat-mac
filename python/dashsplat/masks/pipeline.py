@@ -42,7 +42,17 @@ def build_masks_for_frames(
     detail = detail_for_tier(budget.name.value)
     out_dir.mkdir(parents=True, exist_ok=True)
     prev_by_cam: dict[str, Path] = {}
-    devices: dict[str, str] = {"sky": "unknown", "movers": "unknown", "compute_units": compute_units}
+    # Lazy import avoids circular dependency with ego_identity → masks.ego
+    from dashsplat.ego_identity import load_override
+
+    ov = load_override() or {}
+    ego_model = ov.get("model")
+    devices: dict[str, str] = {
+        "sky": "unknown",
+        "movers": "unknown",
+        "compute_units": compute_units,
+        "ego_model": str(ego_model) if ego_model else "default",
+    }
     for i, fr in enumerate(frames):
         if progress and i % 8 == 0:
             progress(f"Masks {i+1}/{len(frames)}…", 0.2 + 0.2 * i / max(len(frames), 1))
@@ -50,7 +60,7 @@ def build_masks_for_frames(
         cam: CameraId = fr["camera"]  # type: ignore[assignment]
         with Image.open(path) as im:
             w, h = im.size
-        ego = ego_mask_array(cam, w, h)
+        ego = ego_mask_array(cam, w, h, model=ego_model)
         sky, sky_dev = sky_mask(
             path,
             compute_units=compute_units,

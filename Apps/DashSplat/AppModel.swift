@@ -1,6 +1,29 @@
 import Combine
 import Foundation
 
+struct EgoPaintDTO: Codable, Hashable {
+    var code: String?
+    var name: String?
+    var hex: String?
+    var confidence: Double?
+}
+
+struct EgoModelGuessDTO: Codable, Hashable {
+    var model: String
+    var confidence: Double
+    var reasons: [String]?
+}
+
+struct EgoIdentityDTO: Codable, Hashable {
+    var make: String?
+    var paint: EgoPaintDTO?
+    var model_guesses: [EgoModelGuessDTO]?
+    var override: Bool?
+    var method: String?
+    var summary: String?
+    var device: String?
+}
+
 struct DashcamEventDTO: Identifiable, Codable, Hashable {
     var id: String
     var label: String
@@ -11,6 +34,8 @@ struct DashcamEventDTO: Identifiable, Codable, Hashable {
     var latitude: Double?
     var longitude: Double?
     var source_folder: String?
+    var ego_identity: EgoIdentityDTO?
+    var ego_summary: String?
 }
 
 struct LibraryItem: Identifiable, Codable, Hashable {
@@ -23,8 +48,8 @@ struct LibraryItem: Identifiable, Codable, Hashable {
     var elapsed_sec: Double?
     var num_gaussians: Int?
     var warning: String?
+    var ego_summary: String?
 }
-
 struct PipelineProgress: Equatable {
     var message: String
     var fraction: Double
@@ -184,6 +209,31 @@ final class AppModel: ObservableObject {
     func openLibraryItem(_ item: LibraryItem) {
         if let ply = item.ply {
             lastPLYURL = URL(fileURLWithPath: ply)
+        }
+    }
+
+    func applyEgoOverride(model: String?, paintName: String?, paintCode: String?) async {
+        do {
+            try await bridge.setEgoOverride(model: model, paintName: paintName, paintCode: paintCode)
+            if let folderURL {
+                await ingest(folder: folderURL)
+            }
+            statusMessage = "Saved ego vehicle override"
+        } catch {
+            statusMessage = "Override failed: \(error.localizedDescription)"
+            appendLog(statusMessage)
+        }
+    }
+
+    func clearEgoOverride() async {
+        do {
+            try await bridge.clearEgoOverride()
+            if let folderURL {
+                await ingest(folder: folderURL)
+            }
+            statusMessage = "Cleared ego vehicle override"
+        } catch {
+            statusMessage = "Clear override failed: \(error.localizedDescription)"
         }
     }
 }
