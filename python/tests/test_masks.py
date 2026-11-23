@@ -35,12 +35,13 @@ def test_combine_masks_intersection():
 def test_build_masks_writes_pngs(tmp_path: Path):
     img = tmp_path / "front_0000.jpg"
     Image.new("RGB", (64, 48), (100, 140, 200)).save(img)
-    out = build_masks_for_frames(
+    out, devices = build_masks_for_frames(
         [{"path": img, "camera": "front", "file_name": "front_0000.jpg", "speed_mps": 5.0}],
         tmp_path / "masks",
         tier="preview",
     )
     assert (out / "front_0000.png").exists()
+    assert "sky" in devices
 
 
 def test_sky_heuristic_masks_blue_top(tmp_path: Path):

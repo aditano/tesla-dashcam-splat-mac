@@ -54,6 +54,10 @@ def main(argv: list[str] | None = None) -> int:
     p_boot.add_argument("--no-model", action="store_true")
     p_boot.add_argument("--no-trainers", action="store_true")
 
+    p_doc = sub.add_parser("doctor", help="Report chip, RAM, MLX, Core ML, Metal, VideoToolbox")
+    p_doc.add_argument("--json", action="store_true", default=True)
+    p_doc.add_argument("--text", action="store_true", help="Human-readable instead of JSON")
+
     p_quick = sub.add_parser("run", help="Alias: build")
     add_build_args(p_quick)
 
@@ -88,6 +92,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(result, indent=2))
         return int(result.get("exit_code", 1))
+
+    if args.cmd == "doctor":
+        from dashsplat.doctor import run_doctor
+
+        report = run_doctor(as_json=not args.text)
+        # Exit 0 always for diagnostics; warnings are in the payload.
+        return 0 if report else 1
 
     if args.cmd == "bench":
         from dashsplat.bench import run_bench
@@ -129,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def main_folder_argv() -> int:
     argv = sys.argv[1:]
-    known = {"list", "build", "bootstrap", "run", "refine", "bench", "help"}
+    known = {"list", "build", "bootstrap", "run", "refine", "bench", "doctor", "help"}
     if argv and not argv[0].startswith("-") and argv[0] not in known:
         return main(["run", *argv])
     if not argv:

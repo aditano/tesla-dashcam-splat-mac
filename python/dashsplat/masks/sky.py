@@ -24,16 +24,27 @@ def sky_mask_heuristic(image_path: Path) -> np.ndarray:
     return sky
 
 
-def sky_mask(image_path: Path, *, use_coreml: bool = True) -> np.ndarray:
+def sky_mask(
+    image_path: Path,
+    *,
+    use_coreml: bool = True,
+    compute_units: str = "all",
+) -> tuple[np.ndarray, str]:
+    """Return (mask, device_label). Prefer Core ML with computeUnits=.all on Mac."""
     if use_coreml:
         try:
-            return _sky_coreml(image_path)
+            return _sky_coreml(image_path, compute_units=compute_units), f"coreml:{compute_units}"
         except Exception:
             pass
-    return sky_mask_heuristic(image_path)
+    return sky_mask_heuristic(image_path), "cpu_heuristic"
 
 
-def _sky_coreml(image_path: Path) -> np.ndarray:
-    """Optional Core ML skyseg. Raises if unavailable (Linux CI / no model)."""
+def _sky_coreml(image_path: Path, *, compute_units: str = "all") -> np.ndarray:
+    """Optional Core ML skyseg. Raises if unavailable (Linux CI / no model).
+
+    On macOS, Core ML should be configured with computeUnits covering ANE+GPU
+    (never CPU-only when Apple Silicon is available).
+    """
+    _ = (image_path, compute_units)
     # Placeholder hook — real Core ML inference lands when model is bootstrapped.
     raise RuntimeError("skyseg-coreml not installed in this environment")

@@ -9,14 +9,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from dashsplat.cameras import CameraId
-
 # Seconds to add to each camera's wall time when sampling the trajectory.
-DEFAULT_OFFSETS_SEC: dict[CameraId, float] = {
+DEFAULT_OFFSETS_SEC: dict[str, float] = {
     "front": 0.0,
     "back": 0.0,
     "left_repeater": 0.0,
     "right_repeater": 0.0,
+    "left_pillar": 0.0,
+    "right_pillar": 0.0,
 }
 
 

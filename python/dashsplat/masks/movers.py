@@ -54,8 +54,11 @@ def mover_mask(
     prev_image_path: Path | None = None,
     *,
     speed_mps: float = 0.0,
-) -> np.ndarray:
+    compute_units: str = "all",
+) -> tuple[np.ndarray, str]:
+    """Return (mask, device_label). RF-DETR prefers MPS/Core ML when available."""
+    _ = compute_units
     rf = mover_mask_rfdetr(image_path)
     if rf is not None:
-        return rf
-    return mover_mask_ego_motion(image_path, prev_image_path, speed_mps=speed_mps)
+        return rf, "rfdetr"
+    return mover_mask_ego_motion(image_path, prev_image_path, speed_mps=speed_mps), "cpu_motion"

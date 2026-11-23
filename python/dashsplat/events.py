@@ -25,13 +25,15 @@ CAMERA_ALIASES: dict[str, CameraId] = {
     "rear": "back",
     "left_repeater": "left_repeater",
     "right_repeater": "right_repeater",
+    "left_pillar": "left_pillar",
+    "right_pillar": "right_pillar",
     "left": "left_repeater",
     "right": "right_repeater",
 }
 
 NAME_RE = re.compile(
     r"(?P<ts>\d{4}-\d{2}-\d{2}[_-]\d{2}-\d{2}-\d{2})"
-    r"[_-](?P<cam>front|back|rear|left_repeater|right_repeater|left|right)\.mp4$",
+    r"[_-](?P<cam>front|back|rear|left_repeater|right_repeater|left_pillar|right_pillar|left|right)\.mp4$",
     re.IGNORECASE,
 )
 EVENT_FOLDER_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})$")

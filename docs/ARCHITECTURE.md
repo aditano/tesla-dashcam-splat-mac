@@ -63,6 +63,14 @@ Always passes HW3 intrinsics + SEI poses when available, 16-view windows mixing 
 
 No ultralytics / AGPL YOLO.
 
+## HW3 / HW4
+
+See [HW3.md](HW3.md). Auto-detect: four cams ⇒ HW3; pillars present ⇒ HW4. Intrinsics/extrinsics in `cameras.py` are labeled approximations.
+
+## Apple Silicon acceleration
+
+`dashsplat doctor` reports chip, RAM (`hw.memsize`), MLX device, Core ML compute units (`all` = ANE+GPU), Metal, VideoToolbox. Decode prefers `ffmpeg -hwaccel videotoolbox` with parallel cameras; MapAnything windows scale with RAM; trainers prefer Metal (seeded CPU fallback is logged, not silent). Stage devices are written to `devices.json` / bench.
+
 ## First-run bootstrap
 
 `dashsplat bootstrap` creates:

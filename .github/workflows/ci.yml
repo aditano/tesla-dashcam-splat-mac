@@ -43,6 +43,32 @@ jobs:
           code=$?
           echo "cli_list_exit_code=$code"
           exit $code
+      - name: Doctor + bench (devices + timings)
+        shell: bash
+        run: |
+          export PYTHONPATH="$PWD/python"
+          set +e
+          python3 -m dashsplat.cli doctor --text | tee doctor.txt
+          dcode=${PIPESTATUS[0]}
+          echo "doctor_exit_code=$dcode"
+          python3 -m dashsplat.cli doctor > doctor.json
+          EID=$(python3 -m dashsplat.cli list fixtures/sample_teslacam --json | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['id'])")
+          python3 -m dashsplat.cli bench fixtures/sample_teslacam --event "$EID" --trainer seeded --no-mlx --out /tmp/dashsplat-bench | tee bench_out.jsonl
+          bcode=${PIPESTATUS[0]}
+          echo "bench_exit_code=$bcode"
+          test -f /tmp/dashsplat-bench/bench.json && cat /tmp/dashsplat-bench/bench.json
+          if [[ $dcode -ne 0 ]]; then exit $dcode; fi
+          exit $bcode
+      - name: Upload doctor/bench artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: doctor-bench
+          path: |
+            doctor.txt
+            doctor.json
+            /tmp/dashsplat-bench/bench.json
+          if-no-files-found: warn
 
   macos-app:
     name: Build unsigned .app

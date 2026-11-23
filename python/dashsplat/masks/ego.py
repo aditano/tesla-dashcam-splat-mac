@@ -32,6 +32,14 @@ EGO_POLYGONS: dict[CameraId, list[list[tuple[float, float]]]] = {
         # Body along left side of right-repeater view
         [(0.0, 0.25), (0.45, 0.35), (0.55, 1.0), (0.0, 1.0)],
     ],
+    "left_pillar": [
+        # HW4: body / door along lower-right of left pillar view (approx.)
+        [(0.55, 0.45), (1.0, 0.40), (1.0, 1.0), (0.40, 1.0)],
+    ],
+    "right_pillar": [
+        # HW4: body / door along lower-left of right pillar view (approx.)
+        [(0.0, 0.40), (0.45, 0.45), (0.60, 1.0), (0.0, 1.0)],
+    ],
 }
 
 

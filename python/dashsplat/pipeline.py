@@ -10,11 +10,19 @@ from typing import Any, Callable
 import numpy as np
 from PIL import Image
 
+from dashsplat.accel.device import (
+    detect_host,
+    preferred_coreml_units,
+    preferred_mlx_device,
+    preferred_train_device,
+)
+from dashsplat.accel.tune import tune_for_host
 from dashsplat.bootstrap import support_layout
 from dashsplat.color_match import apply_affine, match_cameras_to_front
 from dashsplat.detect import check_event_telemetry
 from dashsplat.events import DashcamEvent, scan_teslacam
 from dashsplat.frames import extract_event_frames
+from dashsplat.hw_profile import profile_for_cameras
 from dashsplat.keyframes import select_keyframes
 from dashsplat.mapanything import (
     pointmap_to_cloud,
@@ -66,8 +74,16 @@ def build_event(
     """Run the pipeline for one event at Preview or Full quality."""
     t0 = time.time()
     stage_t: dict[str, float] = {}
+    stage_devices: dict[str, Any] = {}
     out_dir.mkdir(parents=True, exist_ok=True)
     budget = budget_for(tier)
+    host = detect_host()
+    tuned = tune_for_host(host, tier=budget.name)
+    hw = profile_for_cameras(event.cameras or ["front"])
+    stage_devices["host"] = host.to_dict()
+    stage_devices["hw_profile"] = hw.to_dict()
+    stage_devices["tuned"] = tuned.to_dict()
+    (out_dir / "devices.json").write_text(json.dumps(stage_devices, indent=2))
 
     def check() -> None:
         if cancel_check and cancel_check():
@@ -142,14 +158,17 @@ def build_event(
     _emit(progress, "Extracting frames (all cameras)…", 0.12, stage="keyframes")
     check()
     save_offsets(out_dir / "timing_offsets.json", dict(DEFAULT_OFFSETS_SEC))
-    images, Ks, c2ws, cameras = extract_event_frames(
+    images, Ks, c2ws, cameras, decode_report = extract_event_frames(
         event,
         out_dir,
         traj.poses,
         max_frames_per_camera=min(max_frames, 24) if force_fallback_trainer else max_frames,
         offsets_path=out_dir / "timing_offsets.json",
+        host=host,
+        parallel_cameras=tuned.decode_parallel_cameras,
         progress=progress,
     )
+    stage_devices["decode"] = decode_report
     if not images:
         return {"ok": False, "exit_code": 3, "error": "no frames extracted", "event_id": event.id}
 
@@ -212,14 +231,23 @@ def build_event(
         }
         for c in cameras
     ]
-    masks_dir = build_masks_for_frames(mask_frames, out_dir / "masks", tier=budget.name, progress=progress)
+    masks_dir, mask_devices = build_masks_for_frames(
+        mask_frames,
+        out_dir / "masks",
+        tier=budget.name,
+        compute_units=preferred_coreml_units(host),
+        progress=progress,
+    )
+    stage_devices["masks"] = mask_devices
     stage_t["masks_sec"] = time.time() - t_stage
 
     # --- MapAnything ---
     t_stage = time.time()
-    _emit(progress, "MapAnything geometry…", 0.4, stage="geometry")
+    mlx_dev = preferred_mlx_device(host).value
+    _emit(progress, f"MapAnything geometry ({mlx_dev})…", 0.4, stage="geometry")
     check()
     pointmap = None
+    geom_device = "synthetic_cpu"
     if use_mlx:
         try:
             model_dir = support_layout()["models"] / (
@@ -229,16 +257,19 @@ def build_event(
                 images,
                 Ks,
                 c2ws,
-                window=budget.mapanything_window,
-                stride=budget.mapanything_stride,
+                window=tuned.mapanything_window,
+                stride=tuned.mapanything_stride,
                 use_nc_weights=use_nc_mapanything,
                 cache_dir=model_dir if model_dir.exists() else None,
                 progress=progress,
             )
+            geom_device = mlx_dev
         except Exception as e:
             _emit(progress, f"MapAnything unavailable ({e}); synthetic fallback", 0.42, stage="geometry")
     if pointmap is None:
         pointmap = synthetic_pointmap_from_poses(images, c2ws, Ks, progress=progress)
+        geom_device = "synthetic_cpu"
+    stage_devices["geometry"] = geom_device
     save_pointmap_npz(out_dir / "pointmap.npz", pointmap)
     means, colors = pointmap_to_cloud(pointmap, max_points=250_000)
     means, colors = voxel_downsample(
@@ -248,10 +279,11 @@ def build_event(
 
     # --- train (per tile in Full; single pass Preview) ---
     t_stage = time.time()
-    iters = iterations if iterations is not None else budget.train_iterations
+    iters = iterations if iterations is not None else tuned.train_iterations
+    train_dev = preferred_train_device(host).value
     _emit(
         progress,
-        f"Training splat ({budget.name.value}, {iters} iters)…",
+        f"Training splat ({budget.name.value}, {iters} iters, {train_dev})…",
         0.6,
         stage="train",
         eta_sec=max(0.0, budget.eta_prior_sec - (time.time() - t0)),
@@ -263,13 +295,22 @@ def build_event(
         cameras,
         out_dir,
         iterations=iters,
-        max_splats=budget.max_splats,
+        max_splats=tuned.max_splats,
         masks_dir=masks_dir,
         trainer_name=trainer_name,
         force_fallback=force_fallback_trainer,
         progress=progress,
     )
+    # Flag silent CPU trainer when Apple Silicon expected Metal
+    actual_trainer = train_result.get("trainer")
+    if host.is_apple_silicon and actual_trainer == "seeded" and not force_fallback_trainer:
+        stage_devices["train_warning"] = "Metal trainer unavailable; used seeded CPU fallback"
+    stage_devices["train"] = {
+        "preferred": train_dev,
+        "trainer": actual_trainer,
+    }
     stage_t["train_sec"] = time.time() - t_stage
+    (out_dir / "devices.json").write_text(json.dumps(stage_devices, indent=2))
 
     elapsed = time.time() - t0
     result = {
@@ -292,6 +333,8 @@ def build_event(
         "warning": traj.warning or health.message,
         "has_sei": health.has_sei,
         "eta_prior_sec": budget.eta_prior_sec,
+        "hw_generation": hw.generation.value,
+        "devices": stage_devices,
     }
     (out_dir / "result.json").write_text(json.dumps(result, indent=2))
     _emit(progress, f"Done ({budget.name.value}) in {elapsed:.1f}s", 1.0, stage="done")

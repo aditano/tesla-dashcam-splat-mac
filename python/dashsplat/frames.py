@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import shutil
-import subprocess
 from pathlib import Path
 from typing import Callable
 
 from PIL import Image, ImageDraw
 
-from dashsplat.cameras import HW3_CAMERA_RIG, CameraId, CameraExtrinsics, intrinsics_matrix
+from dashsplat.accel.decode import decode_cameras_parallel, ffmpeg_extract_frames
+from dashsplat.accel.device import HostInfo, detect_host
+from dashsplat.cameras import CAMERA_RIG, CameraId, CameraExtrinsics, intrinsics_matrix
 from dashsplat.events import DashcamEvent
 from dashsplat.timing_offsets import apply_offset, load_offsets
 from dashsplat.trajectory import Pose, apply_vehicle_camera_offset
@@ -27,24 +28,11 @@ def extract_frames_ffmpeg(
     *,
     max_frames: int = 8,
     prefix: str = "frame",
+    host: HostInfo | None = None,
 ) -> list[Path]:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    pattern = out_dir / f"{prefix}_%04d.jpg"
-    # Aim for ~max_frames across the clip; fps filter is approximate
-    vf = f"fps={max(1, max_frames)}/60"
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(mp4),
-        "-vf",
-        vf,
-        "-q:v",
-        "3",
-        str(pattern),
-    ]
-    subprocess.run(cmd, capture_output=True, check=False)
-    frames = sorted(out_dir.glob(f"{prefix}_*.jpg"))[:max_frames]
+    frames, _device = ffmpeg_extract_frames(
+        mp4, out_dir, max_frames=max_frames, prefix=prefix, host=host
+    )
     return frames
 
 
@@ -80,46 +68,69 @@ def extract_event_frames(
     *,
     max_frames_per_camera: int = 6,
     offsets_path: Path | None = None,
+    host: HostInfo | None = None,
+    parallel_cameras: int = 4,
     progress: ProgressCb | None = None,
-) -> tuple[list[Path], list[list[list[float]]], list[list[list[float]]], list[dict]]:
-    """Return image paths, intrinsics, c2w poses, and camera dicts for training."""
+) -> tuple[list[Path], list[list[list[float]]], list[list[list[float]]], list[dict], dict]:
+    """Return image paths, intrinsics, c2w poses, camera dicts, and decode device report."""
     work_dir.mkdir(parents=True, exist_ok=True)
     image_paths: list[Path] = []
     Ks: list[list[list[float]]] = []
     c2ws: list[list[list[float]]] = []
     cameras: list[dict] = []
     offsets = load_offsets(offsets_path or (work_dir / "timing_offsets.json"))
+    host = host or detect_host()
+    decode_devices: dict[str, str] = {}
 
-    cam_ids: list[CameraId] = list(event.cameras) or ["front"]
+    cam_ids: list[CameraId] = list(event.cameras) or ["front"]  # type: ignore[arg-type]
     use_ffmpeg = _have_ffmpeg()
-    idx = 0
-    for ci, cam_id in enumerate(cam_ids):
-        if progress:
-            progress(f"Extracting frames ({cam_id})…", 0.1 + 0.1 * ci / max(len(cam_ids), 1))
-        # Prefer first segment that has this camera
+
+    # Collect mp4 jobs and decode in parallel when ffmpeg is present
+    jobs: list[tuple[Path, Path, str, int]] = []
+    cam_meta: dict[str, tuple[Path, CameraExtrinsics]] = {}
+    for cam_id in cam_ids:
         mp4: Path | None = None
         for seg in event.segments:
             if cam_id in seg.cameras:
                 mp4 = seg.cameras[cam_id]
                 break
-        if mp4 is None:
+        if mp4 is None or cam_id not in CAMERA_RIG:
             continue
-        cam: CameraExtrinsics = HW3_CAMERA_RIG[cam_id]
+        cam = CAMERA_RIG[cam_id]
         out = work_dir / "frames" / cam_id
+        cam_meta[cam_id] = (mp4, cam)
         if use_ffmpeg:
+            jobs.append((mp4, out, cam_id, max_frames_per_camera))
+
+    decoded: dict[str, tuple[list[Path], str]] = {}
+    if jobs:
+        if progress:
+            progress("Decoding cameras in parallel…", 0.1)
+        decoded = decode_cameras_parallel(
+            jobs,
+            host=host,
+            max_workers=max(1, min(parallel_cameras, len(jobs))),
+            progress=progress,
+        )
+
+    idx = 0
+    for ci, cam_id in enumerate(cam_ids):
+        if cam_id not in cam_meta:
+            continue
+        mp4, cam = cam_meta[cam_id]
+        out = work_dir / "frames" / cam_id
+        if cam_id in decoded:
+            frames, device = decoded[cam_id]
+            decode_devices[cam_id] = device
+        elif use_ffmpeg:
             frames = extract_frames_ffmpeg(
-                mp4, out, max_frames=max_frames_per_camera, prefix=cam_id
+                mp4, out, max_frames=max_frames_per_camera, prefix=cam_id, host=host
             )
-            if not frames:
-                frames = extract_placeholder_frames(
-                    mp4,
-                    out,
-                    max_frames=max_frames_per_camera,
-                    prefix=cam_id,
-                    width=cam.width // 4,
-                    height=cam.height // 4,
-                )
+            decode_devices[cam_id] = "ffmpeg"
         else:
+            frames = []
+            decode_devices[cam_id] = "placeholder"
+        if not frames:
             frames = extract_placeholder_frames(
                 mp4,
                 out,
@@ -128,6 +139,9 @@ def extract_event_frames(
                 width=cam.width // 4,
                 height=cam.height // 4,
             )
+            decode_devices[cam_id] = decode_devices.get(cam_id, "placeholder")
+            if decode_devices[cam_id] in ("videotoolbox", "ffmpeg"):
+                decode_devices[cam_id] = "software_fallback_or_placeholder"
 
         K = intrinsics_matrix(cam)
         for fi, frame in enumerate(frames):
@@ -140,12 +154,10 @@ def extract_event_frames(
                 [0.0, K[1][1] * scale_y, K[1][2] * scale_y],
                 [0.0, 0.0, 1.0],
             ]
-            # Sample pose along trajectory (with per-camera time offset)
             if poses:
                 frac = fi / max(len(frames) - 1, 1)
                 raw_t = poses[0].time_sec + frac * (poses[-1].time_sec - poses[0].time_sec)
                 t = apply_offset(raw_t, cam_id, offsets)
-                # nearest pose by time
                 pidx = min(
                     range(len(poses)),
                     key=lambda i: abs(poses[i].time_sec - t),
@@ -179,4 +191,7 @@ def extract_event_frames(
                 }
             )
             idx += 1
-    return image_paths, Ks, c2ws, cameras
+        if progress:
+            progress(f"Extracted {cam_id}", 0.1 + 0.1 * (ci + 1) / max(len(cam_ids), 1))
+    return image_paths, Ks, c2ws, cameras, {"cameras": decode_devices, "host_chip": host.chip}
+

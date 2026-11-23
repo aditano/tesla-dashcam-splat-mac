@@ -64,8 +64,11 @@ dashsplat list <folder> [--json]
 dashsplat build <folder> [--event ID] [--all] [--tier preview|full] [--trainer brush|msplat|seeded]
 dashsplat refine <folder> --event ID   # forces --tier full
 dashsplat bench <folder> --event ID
+dashsplat doctor [--text]
 dashsplat bootstrap
 ```
+
+HW3 is first-class (4 cams). See [docs/HW3.md](docs/HW3.md) for cited resolution/FPS, layout, and approximate extrinsics. HW4 (6 cams with pillars) is auto-detected.
 
 Exit codes: `0` ok · `2` no events · `3` no frames · `4` encrypted / blocked · `130` cancelled · other = tool failure.
 
