@@ -2,13 +2,41 @@ import XCTest
 
 /// Smoke tests that shell out to the Python event scanner (source of truth).
 final class EventScanTests: XCTestCase {
+    /// Resolve the repo `python/` package without assuming `#file` depth.
+    /// Prefers `DASHSPLAT_PYTHON_DIR` / `GITHUB_WORKSPACE`, then walks up from `#file`.
+    private func resolvePythonDir() -> URL? {
+        let env = ProcessInfo.processInfo.environment
+        let candidates: [URL] = [
+            env["DASHSPLAT_PYTHON_DIR"].map { URL(fileURLWithPath: $0) },
+            env["GITHUB_WORKSPACE"].map { URL(fileURLWithPath: $0).appendingPathComponent("python") },
+            env["SRCROOT"].map { URL(fileURLWithPath: $0).appendingPathComponent("python") },
+        ].compactMap { $0 }
+
+        for url in candidates where FileManager.default.fileExists(atPath: url.path) {
+            return url
+        }
+
+        var dir = URL(fileURLWithPath: #file).deletingLastPathComponent()
+        for _ in 0..<8 {
+            let python = dir.appendingPathComponent("python")
+            let marker = python.appendingPathComponent("dashsplat")
+            if FileManager.default.fileExists(atPath: marker.path) {
+                return python
+            }
+            let parent = dir.deletingLastPathComponent()
+            if parent.path == dir.path { break }
+            dir = parent
+        }
+        return nil
+    }
+
     func testPythonListEventsExitCode() throws {
-        let repo = URL(fileURLWithPath: #file)
+        guard let pythonDir = resolvePythonDir() else {
+            throw XCTSkip("python/ not found (set DASHSPLAT_PYTHON_DIR or run from repo checkout)")
+        }
+        let fixtures = pythonDir
             .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let pythonDir = repo.appendingPathComponent("python")
-        let fixtures = repo.appendingPathComponent("fixtures/sample_teslacam")
+            .appendingPathComponent("fixtures/sample_teslacam")
         guard FileManager.default.fileExists(atPath: fixtures.path) else {
             throw XCTSkip("fixtures/sample_teslacam missing")
         }

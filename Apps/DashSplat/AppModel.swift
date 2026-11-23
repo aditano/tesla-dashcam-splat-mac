@@ -115,11 +115,11 @@ final class AppModel: ObservableObject {
     }
 
     func buildPreview() async {
-        await runBuild(tier: "preview")
+        await runBuild(tier: PipelineContract.tierForPreview().rawValue)
     }
 
     func refineToFull() async {
-        await runBuild(tier: "full")
+        await runBuild(tier: PipelineContract.tierForRefine().rawValue)
     }
 
     private func runBuild(tier: String) async {

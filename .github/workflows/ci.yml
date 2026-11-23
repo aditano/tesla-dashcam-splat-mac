@@ -99,6 +99,8 @@ jobs:
           cp fixtures/synthetic/*.mp4 fixtures/sample_teslacam/SavedClips/2025-11-20_14-03-12/
           echo '{"city":"Palo Alto","est_lat":37.3947,"est_lon":-122.1503}' > fixtures/sample_teslacam/SavedClips/2025-11-20_14-03-12/event.json
       - name: XcodeGen + test
+        env:
+          DASHSPLAT_PYTHON_DIR: ${{ github.workspace }}/python
         run: |
           brew install xcodegen
           xcodegen generate

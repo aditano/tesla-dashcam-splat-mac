@@ -230,9 +230,7 @@ struct ContentView: View {
     }
 
     private func formatETA(_ sec: Double) -> String {
-        let s = Int(sec.rounded())
-        if s < 60 { return "~\(s)s left" }
-        return "~\(s / 60)m \(s % 60)s left"
+        PipelineContract.formatETA(sec)
     }
 
     private func pickFolder() {
