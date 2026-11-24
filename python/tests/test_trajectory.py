@@ -58,11 +58,24 @@ def test_build_trajectory_from_sei_samples():
     assert abs(last.position[1]) < 5.0
 
 
-def test_fallback_without_gps():
+def test_fallback_without_gps_marks_unknown_no_invented_prior():
     traj = build_trajectory_from_sei([])
-    assert traj.source == "filename-fallback"
+    assert traj.source == "unknown"
     assert traj.warning
-    assert len(traj.poses) >= 2
+    assert traj.poses == []
+
+
+def test_pose_times_keep_event_clock_not_rezeroed():
+    samples = [
+        SeiSample(1, 1, 0, 10.0, 37.39, -122.15, 90.0, time_sec=60.0 + i)
+        for i in range(5)
+    ]
+    # nudge GPS so samples stay usable
+    for i, s in enumerate(samples):
+        s.longitude_deg = -122.15 + i * 1e-5
+    traj = build_trajectory_from_sei(samples)
+    assert traj.poses[0].time_sec == 60.0
+    assert traj.poses[-1].time_sec == 64.0
 
 
 def test_c2w_right_vector_faces_east_when_heading_north():

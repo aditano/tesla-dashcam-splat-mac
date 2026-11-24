@@ -166,15 +166,17 @@ def decode_partial_manual(payload: bytes) -> SeiSample | None:
 def extract_sei_from_mp4(path: Path, fps: float = 36.0) -> list[SeiSample]:
     """Parse SEI samples and stamp each with a real timeline.
 
-    Prefer ffprobe packet PTS when available; else `frame_seq_no / fps`; else
-    sequential index / fps. Never invent a hard-coded 60 s clip length here.
+    Timestamp **every** decoded SEI payload first (from frame PTS / seq / index),
+    then filter to GPS-usable samples. Filtering before timestamping shifted later
+    times whenever early bad-GPS payloads were dropped.
+
     Times are relative to the start of **this** clip (0-based).
     """
-    samples: list[SeiSample] = []
+    decoded_all: list[SeiSample] = []
     for payload in iter_sei_payloads(path):
         decoded = decode_partial_manual(payload)
-        if decoded and abs(decoded.latitude_deg) > 0.01 and abs(decoded.longitude_deg) > 0.01:
-            samples.append(decoded)
+        if decoded:
+            decoded_all.append(decoded)
 
     pts: list[float] = []
     try:
@@ -184,14 +186,19 @@ def extract_sei_from_mp4(path: Path, fps: float = 36.0) -> list[SeiSample]:
     except Exception:
         pts = []
 
-    for i, s in enumerate(samples):
+    for i, s in enumerate(decoded_all):
         if pts and i < len(pts):
             s.time_sec = float(pts[i])
         elif s.frame_seq_no:
             s.time_sec = float(s.frame_seq_no) / float(fps)
         else:
             s.time_sec = float(i) / float(fps)
-    return samples
+
+    return [
+        s
+        for s in decoded_all
+        if abs(s.latitude_deg) > 0.01 and abs(s.longitude_deg) > 0.01
+    ]
 
 
 def extract_sei_from_event(event, fps: float = 36.0) -> list[SeiSample]:

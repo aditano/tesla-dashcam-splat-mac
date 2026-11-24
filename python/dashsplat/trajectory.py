@@ -113,6 +113,8 @@ def build_trajectory_from_sei(
     fallback_speed_mps: float = 8.0,
     fallback_heading_deg: float = 0.0,
 ) -> TrajectoryResult:
+    # fallback_* kept for API compat but MUST NOT invent a pose prior
+    _ = fallback_duration_sec, fallback_speed_mps, fallback_heading_deg
     usable = [
         s
         for s in samples
@@ -122,9 +124,7 @@ def build_trajectory_from_sei(
         and abs(s.longitude_deg) > 0.01
     ]
     if not usable:
-        return build_constant_velocity_fallback(
-            fallback_duration_sec, fallback_speed_mps, fallback_heading_deg
-        )
+        return build_unknown_poses_fallback()
 
     origin = create_enu_origin(usable[0].latitude_deg, usable[0].longitude_deg)
     raw_headings = unwrap_heading_deg([s.heading_deg or 0.0 for s in usable])
@@ -134,7 +134,8 @@ def build_trajectory_from_sei(
         5,
     )
     gps_pos = [llh_to_enu(s.latitude_deg, s.longitude_deg, origin) for s in usable]
-    times = [s.time_sec if s.time_sec else i / 36.0 for i, s in enumerate(usable)]
+    # Keep event/clip time — do NOT re-zero at first GPS fix (frames use the same clock)
+    times = [float(s.time_sec) if s.time_sec is not None else i / 36.0 for i, s in enumerate(usable)]
 
     integrated: list[tuple[float, float, float]] = []
     x, y = gps_pos[0][0], gps_pos[0][1]
@@ -152,10 +153,9 @@ def build_trajectory_from_sei(
 
     sx = smooth_series([p[0] for p in integrated], 5)
     sy = smooth_series([p[1] for p in integrated], 5)
-    t0 = times[0]
     poses = [
         Pose(
-            time_sec=times[i] - t0,
+            time_sec=times[i],
             position=(sx[i], sy[i], 0.0),
             yaw_rad=heading_deg_to_enu_yaw(smooth_headings[i]),
             heading_deg=smooth_headings[i],
@@ -171,36 +171,27 @@ def build_trajectory_from_sei(
     )
 
 
+def build_unknown_poses_fallback() -> TrajectoryResult:
+    """No SEI GPS — do not invent a constant-velocity prior for geometry."""
+    return TrajectoryResult(
+        poses=[],
+        source="unknown",
+        warning=(
+            "No SEI GPS telemetry found. Poses marked unknown (no invented prior). "
+            "Requires firmware 2025.44.25+ with SEI for accurate poses."
+        ),
+    )
+
+
 def build_constant_velocity_fallback(
     duration_sec: float,
     speed_mps: float,
     heading_deg: float,
     fps: float = 12.0,
 ) -> TrajectoryResult:
-    yaw = heading_deg_to_enu_yaw(heading_deg)
-    fx, fy, _ = yaw_to_forward(yaw)
-    n = max(2, int(math.ceil(duration_sec * fps)))
-    poses: list[Pose] = []
-    for i in range(n):
-        t = (i / (n - 1)) * duration_sec
-        poses.append(
-            Pose(
-                time_sec=t,
-                position=(fx * speed_mps * t, fy * speed_mps * t, 0.0),
-                yaw_rad=yaw,
-                heading_deg=heading_deg,
-                speed_mps=speed_mps,
-                source="filename-fallback",
-            )
-        )
-    return TrajectoryResult(
-        poses=poses,
-        source="filename-fallback",
-        warning=(
-            "No SEI GPS telemetry found. Using constant-velocity fallback. "
-            "Requires firmware 2025.44.25+ with SEI for accurate poses."
-        ),
-    )
+    """Deprecated: do not use as a pose prior. Delegates to unknown poses."""
+    _ = duration_sec, speed_mps, heading_deg, fps
+    return build_unknown_poses_fallback()
 
 
 def apply_vehicle_camera_offset(
