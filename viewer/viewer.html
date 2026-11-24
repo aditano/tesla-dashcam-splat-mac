@@ -321,11 +321,18 @@
       const little = /binary_little_endian/i.test(headerText);
       const nMatch = headerText.match(/element\s+vertex\s+(\d+)/i);
       const n = nMatch ? parseInt(nMatch[1], 10) : 0;
-      const propRe = /property\s+(\w+)\s+(\w+)/gi;
+      // Only vertex-element properties (ignore face/edge/etc.)
       const props = [];
-      let m;
-      while ((m = propRe.exec(headerText)) !== null) {
-        props.push({ type: m[1].toLowerCase(), name: m[2] });
+      let inVertex = false;
+      for (const line of headerText.split(/\r?\n/)) {
+        const el = line.match(/^element\s+(\w+)\s+(\d+)/i);
+        if (el) {
+          inVertex = el[1].toLowerCase() === 'vertex';
+          continue;
+        }
+        if (!inVertex) continue;
+        const pm = line.match(/^property\s+(\w+)\s+(\w+)/i);
+        if (pm) props.push({ type: pm[1].toLowerCase(), name: pm[2] });
       }
       const typeSize = {
         char:1, uchar:1, int8:1, uint8:1,
@@ -342,7 +349,8 @@
       switch (type) {
         case 'float': case 'float32': return { v: view.getFloat32(off, le), n: 4 };
         case 'double': case 'float64': return { v: view.getFloat64(off, le), n: 8 };
-        case 'uchar': case 'uint8': case 'char': case 'int8': return { v: view.getUint8(off), n: 1 };
+        case 'uchar': case 'uint8': return { v: view.getUint8(off), n: 1 };
+        case 'char': case 'int8': return { v: view.getInt8(off), n: 1 };
         case 'ushort': case 'uint16': return { v: view.getUint16(off, le), n: 2 };
         case 'short': case 'int16': return { v: view.getInt16(off, le), n: 2 };
         case 'uint': case 'uint32': return { v: view.getUint32(off, le), n: 4 };

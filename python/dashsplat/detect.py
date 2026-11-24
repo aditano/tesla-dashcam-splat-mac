@@ -21,11 +21,19 @@ class ClipHealth:
 def looks_encrypted_mp4(path: Path, *, header_bytes: int = 256 * 1024) -> bool:
     """Heuristic: Tesla encrypted clips often have 'encv' / 'senc' / 'enca' atoms.
 
-    Reads only the first ``header_bytes`` (default 256 KiB) — never the whole file.
+    Reads the first ``header_bytes`` (default 256 KiB) and the same-sized tail
+    (moov/senc often live at the end of fragmented/fast-start MP4s). Never reads
+    the whole file.
     """
     try:
+        size = path.stat().st_size
         with path.open("rb") as f:
-            data = f.read(header_bytes)
+            head = f.read(header_bytes)
+            tail = b""
+            if size > header_bytes:
+                f.seek(max(0, size - header_bytes))
+                tail = f.read(header_bytes)
+            data = head + tail
     except OSError:
         return True
     if len(data) < 64:
