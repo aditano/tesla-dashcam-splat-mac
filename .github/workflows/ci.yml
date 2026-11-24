@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+# One run per branch — avoid push+PR duplicates starving macos-15 runners
+# (Build/Swift previously sat queued 15m with steps:[] then cancelled).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   python-tests:
     name: Python unit + smoke
