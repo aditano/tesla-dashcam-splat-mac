@@ -39,20 +39,14 @@ def mover_mask_ego_motion(
     img = np.asarray(Image.open(image_path).convert("L"), dtype=np.float32)
     h, w = img.shape
     keep = np.ones((h, w), dtype=np.uint8) * 255
-    if prev_image_path is None or abs(speed_mps) < 0.5:
+    # Raw frame differencing while driving blanks the static scene (ego-motion
+    # looks like "everything moved"). Without ego-motion compensation, only
+    # attempt differencing when nearly stopped; never when speed > threshold.
+    _ = prev_image_path, protect_vegetation, erode_px
+    if abs(speed_mps) > 0.5:
         return keep
-    prev = np.asarray(Image.open(prev_image_path).convert("L"), dtype=np.float32)
-    if prev.shape != img.shape:
-        prev = np.asarray(
-            Image.open(prev_image_path).convert("L").resize((w, h)), dtype=np.float32
-        )
-    diff = np.abs(img - prev)
-    moving = diff > 35.0
-    keep[moving] = 0
-    if protect_vegetation or erode_px:
-        from dashsplat.detail_quality import protect_vegetation_in_mask
-
-        keep = protect_vegetation_in_mask(image_path, keep, erode_px=erode_px)
+    # Parked / crawl: also skip raw differencing (parked cars must stay in scene).
+    # RF-DETR path handles movers when available; this heuristic is a no-op.
     return keep
 
 
