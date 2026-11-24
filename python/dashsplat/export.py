@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import struct
 from pathlib import Path
 from typing import Any
 
@@ -22,19 +21,37 @@ def write_gaussian_ply(
     scales: np.ndarray | None = None,
     opacities: np.ndarray | None = None,
 ) -> None:
-    """Write a 3DGS-compatible PLY (xyz + rgb + scale + opacity + identity rotation)."""
+    """Write a 3DGS-compatible PLY (xyz + rgb + scale + opacity + identity rotation).
+
+    Vectorized numpy pack — avoids a Python loop over every splat.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     n = int(means.shape[0])
     if scales is None:
         scales = np.full((n, 3), 0.05, dtype=np.float32)
     if opacities is None:
         opacities = np.full((n,), 0.9, dtype=np.float32)
-    colors = np.clip(colors, 0, 1)
-    # DC SH approx: (c - 0.5) / 0.28209479177387814
+    colors = np.clip(np.asarray(colors, dtype=np.float64), 0, 1)
     sh_c0 = 0.28209479177387814
-    f_dc = (colors - 0.5) / sh_c0
+    f_dc = ((colors - 0.5) / sh_c0).astype(np.float32)
+    log_s = np.log(np.maximum(np.asarray(scales, dtype=np.float64), 1e-6)).astype(np.float32)
+    o = np.clip(np.asarray(opacities, dtype=np.float64), 1e-4, 1 - 1e-4)
+    logit_o = np.log(o / (1.0 - o)).astype(np.float32)
+    zeros = np.zeros((n, 3), dtype=np.float32)
     quats = np.zeros((n, 4), dtype=np.float32)
-    quats[:, 0] = 1.0  # wxyz identity
+    quats[:, 0] = 1.0
+
+    # Interleave columns: x y z nx ny nz f_dc_0..2 opacity scale_0..2 rot_0..3
+    packed = np.column_stack(
+        [
+            means.astype(np.float32),
+            zeros,
+            f_dc,
+            logit_o,
+            log_s,
+            quats,
+        ]
+    ).astype("<f4", copy=False)
 
     header = (
         "ply\n"
@@ -61,34 +78,7 @@ def write_gaussian_ply(
     )
     with path.open("wb") as f:
         f.write(header.encode("ascii"))
-        for i in range(n):
-            # Store log-scale like many 3DGS exporters
-            log_s = np.log(np.maximum(scales[i], 1e-6))
-            # Inverse sigmoid opacity
-            o = float(np.clip(opacities[i], 1e-4, 1 - 1e-4))
-            logit_o = math_logit(o)
-            f.write(
-                struct.pack(
-                    "<17f",
-                    float(means[i, 0]),
-                    float(means[i, 1]),
-                    float(means[i, 2]),
-                    0.0,
-                    0.0,
-                    0.0,
-                    float(f_dc[i, 0]),
-                    float(f_dc[i, 1]),
-                    float(f_dc[i, 2]),
-                    logit_o,
-                    float(log_s[0]),
-                    float(log_s[1]),
-                    float(log_s[2]),
-                    float(quats[i, 0]),
-                    float(quats[i, 1]),
-                    float(quats[i, 2]),
-                    float(quats[i, 3]),
-                )
-            )
+        f.write(packed.tobytes(order="C"))
 
 
 def math_logit(p: float) -> float:
@@ -102,24 +92,23 @@ def write_simple_point_ply(path: Path, points: np.ndarray, colors: np.ndarray) -
     path.parent.mkdir(parents=True, exist_ok=True)
     n = points.shape[0]
     colors_u8 = (np.clip(colors, 0, 1) * 255).astype(np.uint8)
-    lines = [
-        "ply",
-        "format ascii 1.0",
-        f"element vertex {n}",
-        "property float x",
-        "property float y",
-        "property float z",
-        "property uchar red",
-        "property uchar green",
-        "property uchar blue",
-        "end_header",
-    ]
-    for i in range(n):
-        lines.append(
-            f"{points[i, 0]:.6f} {points[i, 1]:.6f} {points[i, 2]:.6f} "
-            f"{colors_u8[i, 0]} {colors_u8[i, 1]} {colors_u8[i, 2]}"
-        )
-    path.write_text("\n".join(lines) + "\n")
+    header = (
+        "ply\n"
+        "format ascii 1.0\n"
+        f"element vertex {n}\n"
+        "property float x\n"
+        "property float y\n"
+        "property float z\n"
+        "property uchar red\n"
+        "property uchar green\n"
+        "property uchar blue\n"
+        "end_header\n"
+    )
+    # Vectorized body formatting via numpy savetxt-style stack
+    body = np.column_stack([points.astype(np.float64), colors_u8.astype(np.float64)])
+    with path.open("w") as f:
+        f.write(header)
+        np.savetxt(f, body, fmt="%.6f %.6f %.6f %d %d %d")
 
 
 def write_spz_stub(path: Path, means: np.ndarray, colors: np.ndarray) -> None:
