@@ -25,13 +25,17 @@ def _progress(cb: ProgressCb | None, message: str, frac: float) -> None:
 
 
 def _load_mapanything(model_id: str, cache_dir: Path | None = None):
+    """Load via mlx-vlm ``load(path_or_hf_repo, ...)``.
+
+    mlx-vlm 0.8.1 ignores a ``path=`` kwarg — the local cache must be passed as
+    the first positional argument when the directory exists.
+    """
     import mlx.core as mx  # type: ignore  # noqa: F401
     from mlx_vlm import load  # type: ignore
 
-    kwargs: dict[str, Any] = {}
-    if cache_dir is not None:
-        kwargs["path"] = str(cache_dir)
-    return load(model_id, **kwargs)
+    if cache_dir is not None and Path(cache_dir).exists():
+        return load(str(cache_dir))
+    return load(model_id)
 
 
 def _infer_chunk(
