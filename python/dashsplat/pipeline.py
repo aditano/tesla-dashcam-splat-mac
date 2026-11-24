@@ -320,13 +320,26 @@ def build_event(
         detail=detail.trainer_extra(),
         progress=progress,
     )
-    # Flag silent CPU trainer when Apple Silicon expected Metal
+    # Surface which trainer actually produced the PLY (never claim Full Metal for CPU)
     actual_trainer = train_result.get("trainer")
-    if host.is_apple_silicon and actual_trainer == "seeded" and not force_fallback_trainer:
-        stage_devices["train_warning"] = "Metal trainer unavailable; used seeded CPU fallback"
+    cpu_fallback = bool(train_result.get("cpu_fallback")) or (
+        actual_trainer == "seeded" and not force_fallback_trainer
+    )
+    train_warning = None
+    if cpu_fallback:
+        train_warning = (
+            f"Seeded CPU fallback used (requested {trainer_name or 'brush'}; "
+            f"fallback_from={train_result.get('fallback_from')}). "
+            "Not a Metal Full success."
+        )
+        stage_devices["train_warning"] = train_warning
+        _emit(progress, train_warning, 0.96, stage="train")
     stage_devices["train"] = {
         "preferred": train_dev,
         "trainer": actual_trainer,
+        "cpu_fallback": cpu_fallback,
+        "fallback_from": train_result.get("fallback_from"),
+        "fallback_errors": train_result.get("fallback_errors"),
     }
     stage_t["train_sec"] = time.time() - t_stage
     (out_dir / "devices.json").write_text(json.dumps(stage_devices, indent=2))
@@ -343,13 +356,15 @@ def build_event(
         "trajectory_source": traj.source,
         "pointmap_backend": pointmap.get("backend"),
         "trainer": train_result.get("trainer"),
+        "cpu_fallback": cpu_fallback,
+        "fallback_from": train_result.get("fallback_from"),
         "ply": train_result.get("ply"),
         "spz": train_result.get("spz"),
         "cameras": str(out_dir / "cameras.json"),
         "masks": str(masks_dir),
         "num_gaussians": train_result.get("num_gaussians") or int(means.shape[0]),
         "n_tiles": len(tiles),
-        "warning": traj.warning or health.message,
+        "warning": train_warning or traj.warning or health.message,
         "has_sei": health.has_sei,
         "eta_prior_sec": budget.eta_prior_sec,
         "hw_generation": hw.generation.value,
