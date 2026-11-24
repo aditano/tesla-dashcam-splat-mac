@@ -164,11 +164,30 @@ def decode_partial_manual(payload: bytes) -> SeiSample | None:
 
 
 def extract_sei_from_mp4(path: Path, fps: float = 36.0) -> list[SeiSample]:
+    """Parse SEI samples and stamp each with a real timeline.
+
+    Prefer ffprobe packet PTS when available; else `frame_seq_no / fps`; else
+    sequential index / fps. Never invent a hard-coded 60 s clip length here.
+    """
     samples: list[SeiSample] = []
     for payload in iter_sei_payloads(path):
         decoded = decode_partial_manual(payload)
         if decoded and abs(decoded.latitude_deg) > 0.01 and abs(decoded.longitude_deg) > 0.01:
             samples.append(decoded)
+
+    pts: list[float] = []
+    try:
+        from dashsplat.accel.decode import probe_frame_pts_sec
+
+        pts = probe_frame_pts_sec(path)
+    except Exception:
+        pts = []
+
     for i, s in enumerate(samples):
-        s.time_sec = i / fps
+        if pts and i < len(pts):
+            s.time_sec = float(pts[i])
+        elif s.frame_seq_no:
+            s.time_sec = float(s.frame_seq_no) / float(fps)
+        else:
+            s.time_sec = float(i) / float(fps)
     return samples

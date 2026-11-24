@@ -221,28 +221,45 @@ def group_into_events(
 
     buckets: dict[str, dict[str, Any]] = {}
     for c in clips:
-        key = c["event_folder"] or c["timestamp_key"]
+        source = _relative_root_hint(c["relative_path"])
+        # Never merge same-named SavedClips and SentryClips folders.
+        if c["event_folder"]:
+            key = f"{source}/{c['event_folder']}" if source else c["event_folder"]
+        else:
+            key = c["timestamp_key"]
         b = buckets.get(key)
         if not b:
             b = {
                 "key": key,
                 "folder": c["event_folder"],
                 "clips": [],
-                "source_folder": _relative_root_hint(c["relative_path"]),
+                "source_folder": source,
             }
             buckets[key] = b
         b["clips"].append(c)
 
-    # RecentClips-style: merge adjacent folderless timestamps within 90s
+    # RecentClips-style: merge adjacent folderless timestamps within 90s of the
+    # *end* of the current run (not the first clip), so long drives stay one event.
     folderless = [b for b in buckets.values() if not b["folder"]]
     if len(folderless) > 1:
         folderless.sort(key=lambda b: b["key"])
         current = folderless[0]
         for next_b in folderless[1:]:
-            t0 = parse_timestamp_key(current["clips"][0]["timestamp_key"])
-            t1 = parse_timestamp_key(next_b["clips"][0]["timestamp_key"])
-            gap = abs((t1 - t0).total_seconds()) if t0 and t1 else float("inf")
-            if gap <= 90:
+            cur_times = [
+                parse_timestamp_key(c["timestamp_key"]) for c in current["clips"]
+            ]
+            next_times = [
+                parse_timestamp_key(c["timestamp_key"]) for c in next_b["clips"]
+            ]
+            cur_times_f = [t for t in cur_times if t is not None]
+            next_times_f = [t for t in next_times if t is not None]
+            if not cur_times_f or not next_times_f:
+                current = next_b
+                continue
+            t_end = max(cur_times_f)
+            t_start = min(next_times_f)
+            gap = (t_start - t_end).total_seconds()
+            if 0 <= gap <= 90:
                 current["clips"].extend(next_b["clips"])
                 buckets.pop(next_b["key"], None)
             else:
@@ -276,15 +293,20 @@ def group_into_events(
         for seg in segments:
             cam_set.update(seg.cameras.keys())
         duration_sec = max(60.0, (segments[-1].time_offset_sec or 0.0) + 60.0)
-        ej = event_json_by_folder.get(b["key"])
+        # event.json keyed by folder name; also try composite key
+        ej = event_json_by_folder.get(b["folder"] or "") or event_json_by_folder.get(b["key"])
         lat = (ej or {}).get("latitude") or (ej or {}).get("est_lat")
         lon = (ej or {}).get("longitude") or (ej or {}).get("est_lon")
         location_label = (ej or {}).get("city")
         if not location_label and lat is not None and lon is not None:
             location_label = f"{float(lat):.4f}, {float(lon):.4f}"
+        # Prefer stable folder id; include source when present to avoid collisions
+        event_id = b["folder"] or b["key"]
+        if b.get("source_folder") and b["folder"]:
+            event_id = f"{b['source_folder']}/{b['folder']}"
         events.append(
             DashcamEvent(
-                id=b["key"],
+                id=event_id,
                 label=format_event_label(start),
                 start=start,
                 duration_sec=duration_sec,
