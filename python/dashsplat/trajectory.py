@@ -216,11 +216,13 @@ def apply_vehicle_camera_offset(
     north = pose.position[1] + sy * bx + cy * by
     up = pose.position[2] + bz
     yaw = pose.yaw_rad + math.radians(cam_yaw_offset_deg)
+    # Compass heading increases clockwise; ENU yaw increases CCW.
+    # heading ≈ 90° − degrees(yaw), so Δheading = −Δyaw_offset.
     return Pose(
         time_sec=pose.time_sec,
         position=(east, north, up),
         yaw_rad=yaw,
-        heading_deg=pose.heading_deg + cam_yaw_offset_deg,
+        heading_deg=pose.heading_deg - cam_yaw_offset_deg,
         speed_mps=pose.speed_mps,
         source=pose.source,
     )

@@ -5,11 +5,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
 
+def _maybe_own_process_group() -> None:
+    """Become process-group leader so the Mac app can kill brush/ffmpeg children."""
+    if os.environ.get("DASHSPLAT_OWN_PGROUP", "1") != "1":
+        return
+    if sys.platform == "win32":
+        return
+    try:
+        os.setpgrp()
+    except OSError:
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _maybe_own_process_group()
     parser = argparse.ArgumentParser(
         prog="dashsplat",
         description="TeslaCam → MapAnything (MLX) → 3D Gaussian Splat (Brush/msplat Metal)",
@@ -134,7 +148,18 @@ def main(argv: list[str] | None = None) -> int:
             iterations=getattr(args, "iterations", None),
             max_frames_per_camera=getattr(args, "max_frames", None),
         )
-        print(json.dumps({"type": "summary", "exit_code": summary["exit_code"], "ok": summary["ok"], "tier": summary.get("tier")}, indent=2))
+        # Single-line JSON so the Swift bridge can parse one progress/result line at a time.
+        print(
+            json.dumps(
+                {
+                    "type": "summary",
+                    "exit_code": summary["exit_code"],
+                    "ok": summary["ok"],
+                    "tier": summary.get("tier"),
+                }
+            ),
+            flush=True,
+        )
         return int(summary.get("exit_code", 1))
 
     return 1
