@@ -9,12 +9,15 @@ import sys
 from pathlib import Path
 from typing import Callable
 
+from dashsplat.mapanything import MAPANYTHING_HF_APACHE, MAPANYTHING_GIT_COMMIT
+
 ProgressCb = Callable[[str, float], None]
 
 APP_SUPPORT_NAME = "DashSplat"
-MAPANYTHING_REPO = "mlx-community/map-anything-apache-fp16"
+# Official HF weights (Apache). Legacy mlx-community id kept only as alias in mapanything.py.
+MAPANYTHING_REPO = MAPANYTHING_HF_APACHE
 # Keep in sync with Apps/DashSplat/Services/PythonBridge.swift bootstrapMarkerVersion
-BOOTSTRAP_MARKER_VERSION = "1.1.0"
+BOOTSTRAP_MARKER_VERSION = "1.2.0"  # bump: PyTorch MapAnything + uv pin
 
 
 def default_support_dir() -> Path:
@@ -53,16 +56,32 @@ def ensure_uv() -> str:
     uv = shutil.which("uv")
     if uv:
         return uv
-    subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import urllib.request; urllib.request.urlretrieve('https://astral.sh/uv/install.sh', '/tmp/uv-install.sh')",
-        ],
-        check=False,
-    )
-    if Path("/tmp/uv-install.sh").exists():
-        subprocess.run(["sh", "/tmp/uv-install.sh"], check=False)
+    # Pin installer script version; write to a unique mktemp path (not fixed /tmp).
+    import tempfile
+
+    uv_installer_version = "0.6.14"
+    install_url = f"https://astral.sh/uv/{uv_installer_version}/install.sh"
+    with tempfile.NamedTemporaryFile(prefix="uv-install-", suffix=".sh", delete=False) as tf:
+        script_path = Path(tf.name)
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import urllib.request; "
+                    f"urllib.request.urlretrieve({install_url!r}, {str(script_path)!r})"
+                ),
+            ],
+            check=False,
+        )
+        if script_path.exists() and script_path.stat().st_size > 0:
+            subprocess.run(["sh", str(script_path)], check=False)
+    finally:
+        try:
+            script_path.unlink(missing_ok=True)
+        except OSError:
+            pass
     return shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
 
 
@@ -160,7 +179,8 @@ def bootstrap(
     pkg_root = Path(__file__).resolve().parents[1]
     extras = "dev"
     if with_mlx and sys.platform == "darwin":
-        extras = "dev,mlx"
+        # Official PyTorch MapAnything (facebookresearch), not mlx-vlm
+        extras = "dev,mapanything"
     # Non-editable install into Application Support venv — never `-e` into the
     # app bundle / source tree (Finder-launched apps must not mutate the bundle).
     code = _run([uv, "pip", "install", "--python", str(py), f"{pkg_root}[{extras}]"])
@@ -169,9 +189,9 @@ def bootstrap(
         if code != 0:
             return {"ok": False, "exit_code": code, "step": "pip"}
 
-    model_path = paths["models"] / "map-anything-apache-fp16"
+    model_path = paths["models"] / "facebook-map-anything-apache"
     if download_model and with_mlx and sys.platform == "darwin":
-        report(f"Downloading {MAPANYTHING_REPO}…", 0.55)
+        report(f"Downloading {MAPANYTHING_HF_APACHE} (pkg @{MAPANYTHING_GIT_COMMIT[:7]})…", 0.55)
         try:
             code = _run(
                 [
@@ -179,7 +199,7 @@ def bootstrap(
                     "-c",
                     (
                         "from huggingface_hub import snapshot_download; "
-                        f"snapshot_download('{MAPANYTHING_REPO}', local_dir=r'{model_path}')"
+                        f"snapshot_download('{MAPANYTHING_HF_APACHE}', local_dir=r'{model_path}')"
                     ),
                 ]
             )

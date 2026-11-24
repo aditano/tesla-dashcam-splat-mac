@@ -9,7 +9,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Official facebookresearch/map-anything @ 3d10cf7 (pkg 1.1.4). mlx-vlm has no MapAnything model.
+mapanything = [
+  "torch>=2.3",
+  "huggingface-hub>=0.24",
+  "mapanything @ git+https://github.com/facebookresearch/map-anything.git@3d10cf7a3016fc0f9bb13a071ee66c47b10be0d9",
+]
 mlx = [
+  # Legacy optional; MapAnything path no longer uses mlx-vlm.
   "mlx>=0.22",
   "mlx-vlm>=0.7.5",
   "huggingface-hub>=0.24",
