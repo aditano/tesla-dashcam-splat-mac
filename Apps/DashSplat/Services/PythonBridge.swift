@@ -50,7 +50,7 @@ final class PythonBridge {
     private var cancelRequested = false
 
     /// Bootstrap marker schema version — bump when deps/layout change.
-    static let bootstrapMarkerVersion = "1.1.0"
+    static let bootstrapMarkerVersion = "1.2.0"
 
     init() {
         let home = FileManager.default.homeDirectoryForCurrentUser
@@ -113,21 +113,20 @@ final class PythonBridge {
         processLock.lock()
         let proc = activeProcess
         processLock.unlock()
-        guard let proc, proc.isRunning else { return }
+        guard let proc else { return }
         let pid = proc.processIdentifier
-        // Python is started as its own process group (os.setpgrp); kill the
-        // whole group so brush/ffmpeg children die with it.
+        // Python is started as its own process group when DASHSPLAT_OWN_PGROUP=1.
+        // Always SIGTERM the group, then after timeout always SIGKILL the group
+        // regardless of whether the leader process still reports isRunning
+        // (orphaned brush/ffmpeg children may outlive the leader).
         kill(-pid, SIGTERM)
-        proc.terminate() // also signal the leader
+        if proc.isRunning {
+            proc.terminate()
+        }
         DispatchQueue.global().async {
-            let deadline = Date().addingTimeInterval(5.0)
-            while proc.isRunning, Date() < deadline {
-                Thread.sleep(forTimeInterval: 0.1)
-            }
-            if proc.isRunning {
-                kill(-pid, SIGKILL)
-                kill(pid, SIGKILL)
-            }
+            Thread.sleep(forTimeInterval: 5.0)
+            kill(-pid, SIGKILL)
+            kill(pid, SIGKILL)
         }
     }
 
@@ -422,12 +421,24 @@ final class PythonBridge {
             activeProcess = process
             processLock.unlock()
 
+            func drainRemaining(_ handle: FileHandle, timeout: TimeInterval) -> Data {
+                // Non-blocking / timeboxed: availableData loops, never readDataToEndOfFile
+                var data = Data()
+                let deadline = Date().addingTimeInterval(timeout)
+                while Date() < deadline {
+                    let chunk = handle.availableData
+                    if chunk.isEmpty { break }
+                    data.append(chunk)
+                    if chunk.count < 4096 { break }
+                }
+                return data
+            }
+
             process.terminationHandler = { [weak self] proc in
                 outPipe.fileHandleForReading.readabilityHandler = nil
                 errPipe.fileHandleForReading.readabilityHandler = nil
-                // Drain any remaining pipe bytes after the process exits
-                let restOut = outPipe.fileHandleForReading.readDataToEndOfFile()
-                let restErr = errPipe.fileHandleForReading.readDataToEndOfFile()
+                let restOut = drainRemaining(outPipe.fileHandleForReading, timeout: 0.5)
+                let restErr = drainRemaining(errPipe.fileHandleForReading, timeout: 0.5)
                 ioLock.lock()
                 if !restOut.isEmpty { stdoutBytes.append(restOut) }
                 if !restErr.isEmpty { stderrBytes.append(restErr) }

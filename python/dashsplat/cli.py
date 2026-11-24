@@ -11,8 +11,12 @@ from pathlib import Path
 
 
 def _maybe_own_process_group() -> None:
-    """Become process-group leader so the Mac app can kill brush/ffmpeg children."""
-    if os.environ.get("DASHSPLAT_OWN_PGROUP", "1") != "1":
+    """Become process-group leader only when the Mac app explicitly opts in.
+
+    Default off so Ctrl-C from Terminal still works. The app sets
+    ``DASHSPLAT_OWN_PGROUP=1`` so cancel can kill brush/ffmpeg children.
+    """
+    if os.environ.get("DASHSPLAT_OWN_PGROUP") != "1":
         return
     if sys.platform == "win32":
         return
