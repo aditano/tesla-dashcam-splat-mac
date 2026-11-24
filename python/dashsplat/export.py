@@ -194,41 +194,165 @@ def read_gaussian_ply_xyz_rgb(path: Path) -> tuple[np.ndarray, np.ndarray]:
         return means, np.clip(colors, 0, 1)
 
 
+def _parse_ply_vertex_schema(
+    path: Path,
+) -> tuple[list[str], list[tuple[str, str]], int, bool, bool, int]:
+    """Return (header_lines, props[(type,name)], n, is_ascii, is_le, header_bytes)."""
+    with path.open("rb") as f:
+        header_lines: list[str] = []
+        header_bytes = 0
+        while True:
+            line = f.readline()
+            if not line:
+                raise ValueError(f"truncated PLY header: {path}")
+            header_bytes += len(line)
+            text = line.decode("ascii", errors="replace").rstrip("\n").rstrip("\r")
+            header_lines.append(text)
+            if text == "end_header":
+                break
+        n = 0
+        props: list[tuple[str, str]] = []
+        in_vertex = False
+        for hl in header_lines:
+            if hl.startswith("element "):
+                in_vertex = hl.startswith("element vertex")
+                if in_vertex:
+                    n = int(hl.split()[-1])
+                continue
+            if in_vertex and hl.startswith("property "):
+                parts = hl.split()
+                if len(parts) >= 3:
+                    props.append((parts[1], parts[2]))
+        header = "\n".join(header_lines)
+        is_ascii = "format ascii" in header
+        is_le = "binary_little_endian" in header
+        return header_lines, props, n, is_ascii, is_le, header_bytes
+
+
+def read_gaussian_ply_vertices(path: Path) -> tuple[list[tuple[str, str]], np.ndarray]:
+    """Read full vertex records; returns (props, structured array)."""
+    _header_lines, props, n, is_ascii, is_le, header_bytes = _parse_ply_vertex_schema(path)
+    if not props:
+        raise ValueError(f"no vertex properties in {path}")
+    if is_ascii:
+        raise ValueError(f"ASCII PLY merge not supported for full properties: {path}")
+    endian = "<" if is_le else ">"
+    dt_map = {
+        "float": f"{endian}f4",
+        "float32": f"{endian}f4",
+        "double": f"{endian}f8",
+        "float64": f"{endian}f8",
+        "uchar": "u1",
+        "uint8": "u1",
+        "char": "i1",
+        "int8": "i1",
+        "ushort": f"{endian}u2",
+        "uint16": f"{endian}u2",
+        "short": f"{endian}i2",
+        "int16": f"{endian}i2",
+        "uint": f"{endian}u4",
+        "uint32": f"{endian}u4",
+        "int": f"{endian}i4",
+        "int32": f"{endian}i4",
+    }
+    dtype = np.dtype([(name, dt_map.get(t, f"{endian}f4")) for t, name in props])
+    with path.open("rb") as f:
+        f.seek(header_bytes)
+        raw = f.read(n * dtype.itemsize)
+    if len(raw) < n * dtype.itemsize:
+        raise ValueError(f"short PLY body: {path}")
+    arr = np.frombuffer(raw, dtype=dtype, count=n).copy()
+    return props, arr
+
+
+def write_gaussian_ply_vertices(
+    path: Path,
+    props: list[tuple[str, str]],
+    vertices: np.ndarray,
+    *,
+    little_endian: bool = True,
+) -> None:
+    """Write binary PLY with the given property layout (preserves scale/rot/opacity/SH)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    n = int(vertices.shape[0])
+    fmt = "binary_little_endian" if little_endian else "binary_big_endian"
+    lines = [
+        "ply",
+        f"format {fmt} 1.0",
+        f"element vertex {n}",
+    ]
+    for t, name in props:
+        lines.append(f"property {t} {name}")
+    lines.append("end_header")
+    header = ("\n".join(lines) + "\n").encode("ascii")
+    with path.open("wb") as f:
+        f.write(header)
+        f.write(np.asarray(vertices).tobytes(order="C"))
+
+
 def merge_gaussian_plies(
     paths: list[Path],
     dest: Path,
     *,
     voxel_m: float = 0.05,
     max_points: int | None = None,
-) -> Path:
-    """Concatenate tile PLYs in a common world frame and voxel-dedupe overlap."""
+) -> tuple[Path, int]:
+    """Concatenate tile PLYs preserving ALL vertex properties.
+
+    Requires identical property layouts across tiles (fails loudly otherwise).
+    Voxel-dedupes on xyz; over-cap subsamples uniformly across the merged set
+    (does not drop the last tiles via stride-from-start).
+    Returns (dest, num_gaussians).
+    """
     if not paths:
         raise ValueError("no PLY paths to merge")
-    all_m: list[np.ndarray] = []
-    all_c: list[np.ndarray] = []
+    schemas: list[list[tuple[str, str]]] = []
+    arrays: list[np.ndarray] = []
     for p in paths:
-        m, c = read_gaussian_ply_xyz_rgb(p)
-        if m.shape[0]:
-            all_m.append(m)
-            all_c.append(c)
-    if not all_m:
+        props, arr = read_gaussian_ply_vertices(p)
+        if arr.shape[0] == 0:
+            continue
+        schemas.append(props)
+        arrays.append(arr)
+    if not arrays:
         write_gaussian_ply(dest, np.zeros((0, 3)), np.zeros((0, 3)))
-        return dest
-    means = np.concatenate(all_m, axis=0)
-    colors = np.concatenate(all_c, axis=0)
-    if voxel_m > 0 and means.shape[0]:
-        keys = np.floor(means / voxel_m).astype(np.int64)
-        # Stable unique: keep first occurrence per voxel
+        return dest, 0
+    ref = schemas[0]
+    for i, sch in enumerate(schemas[1:], start=1):
+        if sch != ref:
+            raise ValueError(
+                f"tile PLY property layout mismatch: {paths[0].name} vs {paths[i].name}: "
+                f"{ref} != {sch}"
+            )
+    merged = np.concatenate(arrays, axis=0)
+    if voxel_m > 0 and "x" in merged.dtype.names and merged.shape[0]:
+        xyz = np.column_stack([merged["x"], merged["y"], merged["z"]]).astype(np.float64)
+        keys = np.floor(xyz / voxel_m).astype(np.int64)
         _, idx = np.unique(keys, axis=0, return_index=True)
         idx = np.sort(idx)
-        means = means[idx]
-        colors = colors[idx]
-    if max_points is not None and means.shape[0] > max_points:
-        step = max(1, means.shape[0] // max_points)
-        means = means[::step][:max_points]
-        colors = colors[::step][:max_points]
-    write_gaussian_ply(dest, means, colors)
-    return dest
+        merged = merged[idx]
+    if max_points is not None and merged.shape[0] > max_points:
+        # Uniform subsample across the whole merged set (all tiles)
+        idx = np.linspace(0, merged.shape[0] - 1, max_points).astype(np.int64)
+        merged = merged[idx]
+    write_gaussian_ply_vertices(dest, ref, merged)
+    return dest, int(merged.shape[0])
+
+
+def merge_cameras_json(tile_camera_paths: list[Path], dest: Path) -> int:
+    """Concatenate cameras.json lists from tile dirs into one world-frame file."""
+    cams: list[dict[str, Any]] = []
+    for p in tile_camera_paths:
+        if not p.exists():
+            continue
+        data = json.loads(p.read_text())
+        chunk = data.get("cameras", data if isinstance(data, list) else [])
+        if isinstance(chunk, list):
+            cams.extend(chunk)
+    for i, c in enumerate(cams):
+        c["id"] = i
+    write_cameras_json(dest, cams)
+    return len(cams)
 
 
 def write_spz_stub(path: Path, means: np.ndarray, colors: np.ndarray) -> None:
