@@ -59,6 +59,11 @@ final class AppModel: ObservableObject {
     }
 
     func ensureBootstrap() async {
+        if bridge.isBootstrapComplete() {
+            bootstrapNeeded = false
+            statusMessage = "Ready"
+            return
+        }
         guard bootstrapNeeded else { return }
         isBootstrapping = true
         statusMessage = "Installing Python environment, models & trainers…"
@@ -109,10 +114,10 @@ final class AppModel: ObservableObject {
     }
 
     func cancelBuild() {
+        // Keep isBuilding true until the process actually exits (buttons stay disabled).
+        statusMessage = "Cancelling…"
+        appendLog("Cancel requested (SIGTERM→SIGKILL)")
         bridge.requestCancel()
-        isBuilding = false
-        statusMessage = "Cancelled"
-        progress = nil
     }
 
     func buildPreview() async {
@@ -133,7 +138,10 @@ final class AppModel: ObservableObject {
         isBuilding = true
         progress = PipelineProgress(message: tier == "full" ? "Refining to full…" : "Preview…", fraction: 0)
         healthWarning = nil
-        defer { isBuilding = false }
+        defer {
+            isBuilding = false
+            progress = nil
+        }
         do {
             let result = try await bridge.build(
                 folder: folderURL,
@@ -141,36 +149,50 @@ final class AppModel: ObservableObject {
                 tier: tier,
                 onProgress: { [weak self] msg, frac, stage, eta in
                     Task { @MainActor in
-                        self?.progress = PipelineProgress(
-                            message: msg,
-                            fraction: frac,
-                            stage: stage,
-                            etaSec: eta
-                        )
+                        if frac >= 0 {
+                            self?.progress = PipelineProgress(
+                                message: msg,
+                                fraction: frac,
+                                stage: stage,
+                                etaSec: eta
+                            )
+                        }
                         self?.appendLog(msg)
                         if msg.lowercased().contains("encrypt") || msg.lowercased().contains("no sei") {
                             self?.healthWarning = msg
                         }
+                    }
+                },
+                onLog: { [weak self] line, isStderr in
+                    Task { @MainActor in
+                        self?.appendLog(isStderr ? "[stderr] \(line)" : line)
                     }
                 }
             )
             if let ply = result.plyURL {
                 lastPLYURL = ply
             }
-            canRefine = tier == "preview" && result.ok
+            canRefine = tier == "preview" && result.ok && !result.cpuFallback
             if let warn = result.warning {
                 healthWarning = warn
             }
-            statusMessage = result.ok
-                ? "\(tier.capitalized) done → \(result.plyURL?.lastPathComponent ?? "")"
-                : "Build failed (exit \(result.exitCode))"
+            if result.exitCode == 130 {
+                statusMessage = "Cancelled"
+            } else if result.ok {
+                let trainerNote = result.cpuFallback
+                    ? " (CPU seeded fallback — not Metal Full)"
+                    : (result.trainer.map { " [\($0)]" } ?? "")
+                statusMessage =
+                    "\(tier.capitalized) done\(trainerNote) → \(result.plyURL?.lastPathComponent ?? "")"
+            } else {
+                statusMessage = "Build failed (exit \(result.exitCode))"
+            }
             appendLog(statusMessage)
             await refreshLibrary()
         } catch {
             statusMessage = "Build error: \(error.localizedDescription)"
             appendLog(statusMessage)
         }
-        progress = nil
     }
 
     func refreshLibrary() async {

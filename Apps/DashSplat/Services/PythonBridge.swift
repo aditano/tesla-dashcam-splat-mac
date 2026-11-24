@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 struct BuildResult {
@@ -5,6 +6,8 @@ struct BuildResult {
     var exitCode: Int
     var plyURL: URL?
     var warning: String?
+    var trainer: String?
+    var cpuFallback: Bool
 }
 
 enum PythonBridgeError: Error, LocalizedError {
@@ -24,10 +27,30 @@ enum PythonBridgeError: Error, LocalizedError {
     }
 }
 
+/// Stable, unique job directory name from a volume/folder URL (not just lastPathComponent).
+enum JobPath {
+    static func directoryName(for folder: URL) -> String {
+        let path = folder.standardizedFileURL.path
+        let digest = SHA256.hash(data: Data(path.utf8))
+        let hex = digest.map { String(format: "%02x", $0) }.joined()
+        let short = String(hex.prefix(16))
+        let base = folder.lastPathComponent
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: ":", with: "_")
+        return "\(base)-\(short)"
+    }
+}
+
 final class PythonBridge {
     private let supportDir: URL
     private let repoPython: URL
     private var cancelFlagURL: URL?
+    private let processLock = NSLock()
+    private var activeProcess: Process?
+    private var cancelRequested = false
+
+    /// Bootstrap marker schema version — bump when deps/layout change.
+    static let bootstrapMarkerVersion = "1.1.0"
 
     init() {
         let home = FileManager.default.homeDirectoryForCurrentUser
@@ -49,6 +72,28 @@ final class PythonBridge {
         supportDir.appendingPathComponent("venv/bin/python")
     }
 
+    private var bootstrapMarkerURL: URL {
+        supportDir.appendingPathComponent(".bootstrap_ok")
+    }
+
+    /// True when Application Support already has a completed bootstrap for this marker version.
+    func isBootstrapComplete() -> Bool {
+        let marker = bootstrapMarkerURL
+        guard FileManager.default.fileExists(atPath: marker.path),
+              FileManager.default.isExecutableFile(atPath: venvPython.path),
+              let data = try? Data(contentsOf: marker),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let version = obj["version"] as? String
+        else {
+            return false
+        }
+        return version == Self.bootstrapMarkerVersion
+    }
+
+    func jobDirectory(for folder: URL) -> URL {
+        supportDir.appendingPathComponent("jobs/\(JobPath.directoryName(for: folder))", isDirectory: true)
+    }
+
     private func resolvePython() -> URL? {
         if FileManager.default.isExecutableFile(atPath: venvPython.path) {
             return venvPython
@@ -61,13 +106,33 @@ final class PythonBridge {
     }
 
     func requestCancel() {
+        cancelRequested = true
         if let cancelFlagURL {
             try? "1".write(to: cancelFlagURL, atomically: true, encoding: .utf8)
+        }
+        processLock.lock()
+        let proc = activeProcess
+        processLock.unlock()
+        guard let proc, proc.isRunning else { return }
+        proc.terminate() // SIGTERM
+        DispatchQueue.global().async {
+            let deadline = Date().addingTimeInterval(5.0)
+            while proc.isRunning, Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            if proc.isRunning {
+                // SIGKILL after timeout
+                kill(proc.processIdentifier, SIGKILL)
+            }
         }
     }
 
     @discardableResult
     func bootstrap(onProgress: @escaping (String, Double) -> Void) async throws -> Int {
+        if isBootstrapComplete() {
+            onProgress("Bootstrap already complete", 1.0)
+            return 0
+        }
         guard let py = resolvePython() ?? URL(fileURLWithPath: "/usr/bin/python3") as URL? else {
             throw PythonBridgeError.pythonMissing
         }
@@ -83,7 +148,8 @@ final class PythonBridge {
                 "PYTHONPATH": repoPython.path,
                 "DASHSPLAT_SUPPORT_DIR": supportDir.path,
             ],
-            onProgress: { msg, frac, _, _ in onProgress(msg, frac) }
+            onProgress: { msg, frac, _, _ in onProgress(msg, frac) },
+            onLog: { _, _ in }
         ).exitCode
     }
 
@@ -94,7 +160,8 @@ final class PythonBridge {
             arguments: ["-m", "dashsplat.cli", "list", folder.path, "--json"],
             cwd: repoPython,
             env: defaultEnv(),
-            onProgress: { _, _, _, _ in }
+            onProgress: { _, _, _, _ in },
+            onLog: { _, _ in }
         )
         guard result.exitCode == 0 else {
             throw PythonBridgeError.processFailed(result.exitCode, result.stderr)
@@ -116,10 +183,9 @@ final class PythonBridge {
     }
 
     func loadLibrary(folder: URL) async throws -> [LibraryItem] {
-        let out = supportDir.appendingPathComponent("jobs/\(folder.lastPathComponent)/library.json")
+        let out = jobDirectory(for: folder).appendingPathComponent("library.json")
         guard FileManager.default.fileExists(atPath: out.path) else { return [] }
         let data = try Data(contentsOf: out)
-        // Pipeline writes full result.json objects; map to LibraryItem
         struct Raw: Codable {
             var event_id: String?
             var label: String?
@@ -129,6 +195,7 @@ final class PythonBridge {
             var elapsed_sec: Double?
             var num_gaussians: Int?
             var warning: String?
+            var cpu_fallback: Bool?
         }
         let raw = try JSONDecoder().decode([Raw].self, from: data)
         return raw.compactMap { r in
@@ -150,12 +217,14 @@ final class PythonBridge {
         folder: URL,
         eventIDs: [String],
         tier: String,
-        onProgress: @escaping (String, Double, String?, Double?) -> Void
+        onProgress: @escaping (String, Double, String?, Double?) -> Void,
+        onLog: @escaping (String, Bool) -> Void
     ) async throws -> BuildResult {
         let py = try requirePython()
-        let out = supportDir.appendingPathComponent("jobs/\(folder.lastPathComponent)", isDirectory: true)
+        let out = jobDirectory(for: folder)
         try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
         cancelFlagURL = out.appendingPathComponent("CANCEL")
+        cancelRequested = false
         try? FileManager.default.removeItem(at: cancelFlagURL!)
 
         var args = [
@@ -163,7 +232,6 @@ final class PythonBridge {
             "--out", out.path,
             "--tier", tier,
         ]
-        // Prefer Brush/msplat on device; seeded only when explicitly forced via env
         if ProcessInfo.processInfo.environment["DASHSPLAT_FORCE_SEEDED"] == "1" {
             args.append(contentsOf: ["--force-fallback-trainer", "--trainer", "seeded"])
         }
@@ -179,13 +247,17 @@ final class PythonBridge {
             arguments: args,
             cwd: repoPython,
             env: defaultEnv(),
-            onProgress: onProgress
+            onProgress: onProgress,
+            onLog: onLog
         )
         var ply: URL?
         var warning: String?
+        var trainer: String?
+        var cpuFallback = false
         if let first = eventIDs.first {
+            let safeID = first.replacingOccurrences(of: "/", with: "_")
             let candidate = out
-                .appendingPathComponent("library/\(first.replacingOccurrences(of: "/", with: "_"))/\(tier)/splat.ply")
+                .appendingPathComponent("library/\(safeID)/\(tier)/splat.ply")
             if FileManager.default.fileExists(atPath: candidate.path) {
                 ply = candidate
             }
@@ -193,12 +265,13 @@ final class PythonBridge {
             if let data = try? Data(contentsOf: resultJSON),
                let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 warning = obj["warning"] as? String
+                trainer = obj["trainer"] as? String
+                cpuFallback = (obj["cpu_fallback"] as? Bool) ?? (trainer == "seeded")
                 if ply == nil, let p = obj["ply"] as? String {
                     ply = URL(fileURLWithPath: p)
                 }
             }
         }
-        // Scan stdout for encrypted / health messages
         for line in proc.stdout.split(whereSeparator: \.isNewline) {
             if let data = String(line).data(using: .utf8),
                let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -207,7 +280,15 @@ final class PythonBridge {
                 warning = msg
             }
         }
-        return BuildResult(ok: proc.exitCode == 0, exitCode: proc.exitCode, plyURL: ply, warning: warning)
+        let exitCode = cancelRequested && proc.exitCode != 0 ? 130 : proc.exitCode
+        return BuildResult(
+            ok: exitCode == 0,
+            exitCode: exitCode,
+            plyURL: ply,
+            warning: warning,
+            trainer: trainer,
+            cpuFallback: cpuFallback
+        )
     }
 
     private func requirePython() throws -> URL {
@@ -234,7 +315,8 @@ final class PythonBridge {
         arguments: [String],
         cwd: URL,
         env: [String: String],
-        onProgress: @escaping (String, Double, String?, Double?) -> Void
+        onProgress: @escaping (String, Double, String?, Double?) -> Void,
+        onLog: @escaping (_ line: String, _ isStderr: Bool) -> Void
     ) async throws -> ProcResult {
         try await withCheckedThrowingContinuation { continuation in
             let process = Process()
@@ -243,6 +325,8 @@ final class PythonBridge {
             process.currentDirectoryURL = cwd
             var fullEnv = ProcessInfo.processInfo.environment
             for (k, v) in env { fullEnv[k] = v }
+            // Force line-buffered Python stdio when possible
+            fullEnv["PYTHONUNBUFFERED"] = "1"
             process.environment = fullEnv
 
             let outPipe = Pipe()
@@ -250,33 +334,85 @@ final class PythonBridge {
             process.standardOutput = outPipe
             process.standardError = errPipe
 
+            let ioLock = NSLock()
             var stdoutBox = ""
             var stderrBox = ""
-            outPipe.fileHandleForReading.readabilityHandler = { handle in
-                let data = handle.availableData
-                guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
-                stdoutBox += chunk
-                for line in chunk.split(whereSeparator: \.isNewline) {
-                    if let parsed = Self.parseProgressLine(String(line)) {
-                        onProgress(parsed.message, parsed.fraction, parsed.stage, parsed.etaSec)
+            var stdoutPartial = ""
+            var stderrPartial = ""
+
+            func appendLines(
+                chunk: String,
+                partial: inout String,
+                accumulate: inout String,
+                isStderr: Bool
+            ) {
+                partial += chunk
+                while let range = partial.rangeOfCharacter(from: .newlines) {
+                    let line = String(partial[..<range.lowerBound])
+                    partial = String(partial[range.upperBound...])
+                    // Skip bare CR leftovers
+                    let trimmed = line.trimmingCharacters(in: CharacterSet(charactersIn: "\r"))
+                    accumulate += trimmed + "\n"
+                    if !trimmed.isEmpty {
+                        onLog(trimmed, isStderr)
+                        if !isStderr, let parsed = Self.parseProgressLine(trimmed) {
+                            onProgress(parsed.message, parsed.fraction, parsed.stage, parsed.etaSec)
+                        }
+                        if isStderr {
+                            // Also surface stderr into progress stream for UI visibility
+                            onProgress("[stderr] \(trimmed)", -1, "log", nil)
+                        }
                     }
                 }
             }
+
+            outPipe.fileHandleForReading.readabilityHandler = { handle in
+                let data = handle.availableData
+                guard !data.isEmpty else { return }
+                let chunk = String(data: data, encoding: .utf8) ?? ""
+                ioLock.lock()
+                appendLines(chunk: chunk, partial: &stdoutPartial, accumulate: &stdoutBox, isStderr: false)
+                ioLock.unlock()
+            }
             errPipe.fileHandleForReading.readabilityHandler = { handle in
                 let data = handle.availableData
-                if let chunk = String(data: data, encoding: .utf8) {
-                    stderrBox += chunk
-                }
+                guard !data.isEmpty else { return }
+                let chunk = String(data: data, encoding: .utf8) ?? ""
+                ioLock.lock()
+                appendLines(chunk: chunk, partial: &stderrPartial, accumulate: &stderrBox, isStderr: true)
+                ioLock.unlock()
             }
 
-            process.terminationHandler = { proc in
+            processLock.lock()
+            activeProcess = process
+            processLock.unlock()
+
+            process.terminationHandler = { [weak self] proc in
                 outPipe.fileHandleForReading.readabilityHandler = nil
                 errPipe.fileHandleForReading.readabilityHandler = nil
+                // Flush trailing partial lines
+                ioLock.lock()
+                if !stdoutPartial.isEmpty {
+                    stdoutBox += stdoutPartial + "\n"
+                    onLog(stdoutPartial, false)
+                    stdoutPartial = ""
+                }
+                if !stderrPartial.isEmpty {
+                    stderrBox += stderrPartial + "\n"
+                    onLog(stderrPartial, true)
+                    stderrPartial = ""
+                }
+                let out = stdoutBox
+                let err = stderrBox
+                ioLock.unlock()
+                self?.processLock.lock()
+                self?.activeProcess = nil
+                self?.processLock.unlock()
                 continuation.resume(
                     returning: ProcResult(
                         exitCode: Int(proc.terminationStatus),
-                        stdout: stdoutBox,
-                        stderr: stderrBox
+                        stdout: out,
+                        stderr: err
                     )
                 )
             }
@@ -284,6 +420,9 @@ final class PythonBridge {
             do {
                 try process.run()
             } catch {
+                processLock.lock()
+                activeProcess = nil
+                processLock.unlock()
                 continuation.resume(throwing: error)
             }
         }
