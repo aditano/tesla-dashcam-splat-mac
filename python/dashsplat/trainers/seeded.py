@@ -11,27 +11,28 @@ from dashsplat.trainers.base import ProgressCb, TrainerConfig, TrainResult
 
 
 def _estimate_tangents(means: np.ndarray) -> np.ndarray | None:
-    """Cheap local PCA tangent without sklearn."""
+    """Cheap local PCA tangent without sklearn — vectorized sliding windows."""
     n = means.shape[0]
     if n < 3:
         return None
-    # For each point, use a random subsample of neighbours by spatial hash bins
-    tangents = np.zeros_like(means)
-    # Sort by x then take sliding window
     order = np.argsort(means[:, 0])
     sorted_m = means[order]
     window = min(12, n)
-    for i in range(n):
-        lo = max(0, i - window // 2)
-        hi = min(n, lo + window)
-        lo = max(0, hi - window)
-        pts = sorted_m[lo:hi]
-        pts = pts - pts.mean(axis=0)
-        try:
-            _, _, vh = np.linalg.svd(pts, full_matrices=False)
-            tangents[order[i]] = vh[0]
-        except np.linalg.LinAlgError:
-            tangents[order[i]] = np.array([1.0, 0.0, 0.0])
+    # Build a (n, window, 3) neighbourhood via clip+broadcast indices
+    centers = np.arange(n)
+    offsets = np.arange(window) - window // 2
+    idxs = np.clip(centers[:, None] + offsets[None, :], 0, n - 1)
+    pts = sorted_m[idxs]  # (n, window, 3)
+    pts = pts - pts.mean(axis=1, keepdims=True)
+    # Batched SVD on neighbourhoods
+    try:
+        _, _, vh = np.linalg.svd(pts, full_matrices=False)
+        tangents_sorted = vh[:, 0, :]  # (n, 3)
+    except np.linalg.LinAlgError:
+        tangents_sorted = np.zeros((n, 3), dtype=means.dtype)
+        tangents_sorted[:, 0] = 1.0
+    tangents = np.zeros_like(means)
+    tangents[order] = tangents_sorted
     norms = np.linalg.norm(tangents, axis=1, keepdims=True) + 1e-8
     return tangents / norms
 

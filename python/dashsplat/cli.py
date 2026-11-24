@@ -53,6 +53,7 @@ def main(argv: list[str] | None = None) -> int:
     p_boot.add_argument("--no-mlx", action="store_true")
     p_boot.add_argument("--no-model", action="store_true")
     p_boot.add_argument("--no-trainers", action="store_true")
+    p_boot.add_argument("--force", action="store_true", help="Re-run even if marker version matches")
 
     p_doc = sub.add_parser("doctor", help="Report chip, RAM, MLX, Core ML, Metal, VideoToolbox")
     p_doc.add_argument("--json", action="store_true", default=True)
@@ -89,6 +90,7 @@ def main(argv: list[str] | None = None) -> int:
             with_mlx=not args.no_mlx,
             download_model=not args.no_model,
             with_trainers=not args.no_trainers,
+            force=bool(getattr(args, "force", False)),
         )
         print(json.dumps(result, indent=2))
         return int(result.get("exit_code", 1))

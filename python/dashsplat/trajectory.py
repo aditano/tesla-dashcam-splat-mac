@@ -30,9 +30,14 @@ class Pose:
     source: str = "sei"
 
     def c2w_matrix(self, z: float = 1.2) -> list[list[float]]:
-        """OpenCV-ish camera-to-world (right, down, forward columns)."""
+        """OpenCV-ish camera-to-world (right, down, forward columns).
+
+        Right-handed ENU: facing yaw, forward=[cos,sin,0], down=[0,0,-1],
+        right = down × forward = [sin, -cos, 0]. (Previously [-sin, cos, 0]
+        mirrored left/right.)
+        """
         c, s = math.cos(self.yaw_rad), math.sin(self.yaw_rad)
-        right = [-s, c, 0.0]
+        right = [s, -c, 0.0]
         down = [0.0, 0.0, -1.0]
         forward = [c, s, 0.0]
         east, north, _ = self.position

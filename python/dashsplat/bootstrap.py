@@ -13,6 +13,8 @@ ProgressCb = Callable[[str, float], None]
 
 APP_SUPPORT_NAME = "DashSplat"
 MAPANYTHING_REPO = "mlx-community/map-anything-apache-fp16"
+# Keep in sync with Apps/DashSplat/Services/PythonBridge.swift bootstrapMarkerVersion
+BOOTSTRAP_MARKER_VERSION = "1.1.0"
 
 
 def default_support_dir() -> Path:
@@ -95,6 +97,20 @@ def _install_trainers(py: Path, bin_dir: Path, report: Callable[[str, float], No
     return info
 
 
+def bootstrap_is_complete(support_dir: Path | None = None) -> bool:
+    """True when marker version matches and venv python exists (outside the app bundle)."""
+    paths = support_layout(support_dir)
+    marker = paths["marker"]
+    py = paths["venv"] / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+    if not marker.exists() or not py.exists():
+        return False
+    try:
+        data = json.loads(marker.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return data.get("version") == BOOTSTRAP_MARKER_VERSION
+
+
 def bootstrap(
     *,
     support_dir: Path | None = None,
@@ -102,8 +118,13 @@ def bootstrap(
     download_model: bool = True,
     with_trainers: bool = True,
     progress: ProgressCb | None = None,
+    force: bool = False,
 ) -> dict:
-    """Install Python deps, trainers, and optionally MapAnything weights. Idempotent."""
+    """Install Python deps, trainers, and optionally MapAnything weights.
+
+    Always writes into Application Support (never the app bundle). Idempotent:
+    skips work when the marker version already matches unless ``force``.
+    """
     paths = support_layout(support_dir)
     for key in ("root", "models", "cache", "jobs", "bin"):
         paths[key].mkdir(parents=True, exist_ok=True)
@@ -113,16 +134,29 @@ def bootstrap(
             progress(msg, frac)
         print(json.dumps({"type": "progress", "message": msg, "fraction": frac}), flush=True)
 
+    if not force and bootstrap_is_complete(support_dir):
+        report("Bootstrap already complete — skipping", 1.0)
+        existing = json.loads(paths["marker"].read_text())
+        return {
+            "ok": True,
+            "exit_code": 0,
+            "skipped": True,
+            **existing,
+            "paths": {k: str(v) for k, v in paths.items()},
+        }
+
     report("Locating uv…", 0.05)
     uv = ensure_uv()
-    report("Creating virtualenv…", 0.15)
+    report("Creating virtualenv (with pip via --seed)…", 0.15)
     venv = paths["venv"]
-    code = _run([uv, "venv", str(venv)])
+    # --seed ensures pip exists so msplat and other pip-only packages install cleanly
+    code = _run([uv, "venv", "--seed", str(venv)])
     if code != 0:
         return {"ok": False, "exit_code": code, "step": "venv"}
 
     py = venv / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
     report("Installing dashsplat package…", 0.35)
+    # Install from the repo/bundle *source* into Application Support venv — never mutate the bundle.
     pkg_root = Path(__file__).resolve().parents[1]
     extras = "dev"
     if with_mlx and sys.platform == "darwin":
@@ -161,13 +195,14 @@ def bootstrap(
         report("Skipping trainer install", 0.85)
 
     marker = {
-        "version": "1.0.0",
+        "version": BOOTSTRAP_MARKER_VERSION,
         "venv": str(venv),
         "python": str(py),
         "model_dir": str(model_path),
         "mapanything_repo": MAPANYTHING_REPO,
         "trainers": trainer_info,
         "default_trainer": "brush",
+        "support_root": str(paths["root"]),
     }
     paths["marker"].write_text(json.dumps(marker, indent=2))
     report("Bootstrap complete", 1.0)

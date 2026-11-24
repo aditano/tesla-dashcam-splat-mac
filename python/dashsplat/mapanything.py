@@ -24,36 +24,28 @@ def _progress(cb: ProgressCb | None, message: str, frac: float) -> None:
         cb(message, frac)
 
 
-def run_mapanything_mlx(
-    image_paths: list[Path],
-    intrinsics: list[list[list[float]]] | None = None,
-    camera_poses: list[list[list[float]]] | None = None,
-    model_id: str = MAPANYTHING_REPO,
-    cache_dir: Path | None = None,
-    progress: ProgressCb | None = None,
-) -> dict[str, Any]:
-    """Run MapAnything and return stacked pointmaps + poses.
-
-    Returns dict with keys: pts3d (N,H,W,3), colors (N,H,W,3), conf (N,H,W),
-    camera_poses, intrinsics, backend.
-    """
-    _progress(progress, "Loading MapAnything (MLX)…", 0.05)
-    try:
-        import mlx.core as mx  # type: ignore
-        from mlx_vlm import load  # type: ignore
-    except ImportError as e:
-        raise RuntimeError(
-            "mlx / mlx-vlm not installed. Install optional deps: pip install 'dashsplat[mlx]'"
-        ) from e
+def _load_mapanything(model_id: str, cache_dir: Path | None = None):
+    import mlx.core as mx  # type: ignore  # noqa: F401
+    from mlx_vlm import load  # type: ignore
 
     kwargs: dict[str, Any] = {}
     if cache_dir is not None:
         kwargs["path"] = str(cache_dir)
-    model, processor = load(model_id, **kwargs)
+    return load(model_id, **kwargs)
 
-    views_spec: list[dict[str, Any]] = []
+
+def _infer_chunk(
+    model: Any,
+    processor: Any,
+    image_paths: list[Path],
+    intrinsics: list[list[list[float]]] | None,
+    camera_poses: list[list[list[float]]] | None,
+) -> dict[str, Any]:
+    """Run one MapAnything window; returns compact arrays (may be downsampled)."""
+    import mlx.core as mx  # type: ignore
     from PIL import Image
 
+    views_spec: list[dict[str, Any]] = []
     for i, p in enumerate(image_paths):
         img = Image.open(p).convert("RGB")
         entry: dict[str, Any] = {"img": img}
@@ -63,7 +55,6 @@ def run_mapanything_mlx(
             entry["camera_poses"] = np.asarray(camera_poses[i], dtype=np.float32)
         views_spec.append(entry)
 
-    _progress(progress, "Running MapAnything infer…", 0.3)
     views = processor.preprocess(views_spec)
     predictions = model.infer(views)
     mx.eval(predictions)
@@ -74,8 +65,6 @@ def run_mapanything_mlx(
     pose_list = []
     K_list = []
     for i, pred in enumerate(predictions):
-        pts = np.array(pred["pts3d"]).reshape(-1, 3) if False else np.array(pred["pts3d"])
-        # pred["pts3d"] is (1,H,W,3)
         pts3d = np.array(pred["pts3d"])
         if pts3d.ndim == 4:
             pts3d = pts3d[0]
@@ -86,24 +75,69 @@ def run_mapanything_mlx(
             conf = conf[..., 0]
         img = Image.open(image_paths[i]).convert("RGB")
         img_np = np.asarray(img).astype(np.float32) / 255.0
-        # Resize colors to pointmap resolution if needed
         h, w = pts3d.shape[:2]
         if img_np.shape[0] != h or img_np.shape[1] != w:
             img = img.resize((w, h))
             img_np = np.asarray(img).astype(np.float32) / 255.0
-        pts_list.append(pts3d)
-        col_list.append(img_np)
-        conf_list.append(conf)
-        pose_list.append(np.array(pred["camera_poses"])[0] if np.array(pred["camera_poses"]).ndim == 3 else np.array(pred["camera_poses"]))
-        K_list.append(np.array(pred["intrinsics"])[0] if np.array(pred["intrinsics"]).ndim == 3 else np.array(pred["intrinsics"]))
+        # Downsample full-res depth maps immediately to limit peak memory
+        if h * w > 320 * 240:
+            step = max(1, int(np.ceil(np.sqrt((h * w) / (320 * 240)))))
+            pts3d = pts3d[::step, ::step]
+            conf = conf[::step, ::step]
+            img_np = img_np[::step, ::step]
+        pts_list.append(pts3d.astype(np.float32))
+        col_list.append(img_np.astype(np.float32))
+        conf_list.append(conf.astype(np.float32))
+        pose_list.append(
+            np.array(pred["camera_poses"])[0]
+            if np.array(pred["camera_poses"]).ndim == 3
+            else np.array(pred["camera_poses"])
+        )
+        K_list.append(
+            np.array(pred["intrinsics"])[0]
+            if np.array(pred["intrinsics"]).ndim == 3
+            else np.array(pred["intrinsics"])
+        )
 
-    _progress(progress, "MapAnything done", 0.9)
     return {
         "pts3d": np.stack(pts_list, axis=0),
         "colors": np.stack(col_list, axis=0),
         "conf": np.stack(conf_list, axis=0),
         "camera_poses": pose_list,
         "intrinsics": K_list,
+    }
+
+
+def run_mapanything_mlx(
+    image_paths: list[Path],
+    intrinsics: list[list[list[float]]] | None = None,
+    camera_poses: list[list[list[float]]] | None = None,
+    model_id: str = MAPANYTHING_REPO,
+    cache_dir: Path | None = None,
+    progress: ProgressCb | None = None,
+    model_and_processor: tuple[Any, Any] | None = None,
+) -> dict[str, Any]:
+    """Run MapAnything and return stacked pointmaps + poses.
+
+    Returns dict with keys: pts3d (N,H,W,3), colors (N,H,W,3), conf (N,H,W),
+    camera_poses, intrinsics, backend.
+    """
+    _progress(progress, "Loading MapAnything (MLX)…", 0.05)
+    try:
+        if model_and_processor is None:
+            model, processor = _load_mapanything(model_id, cache_dir)
+        else:
+            model, processor = model_and_processor
+    except ImportError as e:
+        raise RuntimeError(
+            "mlx / mlx-vlm not installed. Install optional deps: pip install 'dashsplat[mlx]'"
+        ) from e
+
+    _progress(progress, "Running MapAnything infer…", 0.3)
+    chunk = _infer_chunk(model, processor, image_paths, intrinsics, camera_poses)
+    _progress(progress, "MapAnything done", 0.9)
+    return {
+        **chunk,
         "backend": "mlx-mapanything",
         "model_id": model_id,
     }
@@ -123,24 +157,32 @@ def run_mapanything_windows(
 ) -> dict[str, Any]:
     """Run MapAnything over overlapping windows that mix all cameras/times.
 
-    Always passes HW3 intrinsics + telemetry poses. Default weights are Apache;
-    set use_nc_weights=True for the personal-use CC BY-NC variant (off by default).
+    Loads the model **once** outside the window loop. Accumulates best-confidence
+    points without retaining every full-res depth map for all views at once —
+    windows are downsampled and merged into fixed-size buffers.
     """
     mid = model_id or (MAPANYTHING_NC_REPO if use_nc_weights else MAPANYTHING_REPO)
     n = len(image_paths)
     if n == 0:
         raise ValueError("no images")
-    if n <= window:
-        return run_mapanything_mlx(
-            image_paths,
-            intrinsics=intrinsics,
-            camera_poses=camera_poses,
-            model_id=mid,
-            cache_dir=cache_dir,
-            progress=progress,
-        )
 
-    # Accumulate best-confidence per view
+    _progress(progress, "Loading MapAnything once…", 0.05)
+    try:
+        model, processor = _load_mapanything(mid, cache_dir)
+    except ImportError as e:
+        raise RuntimeError(
+            "mlx / mlx-vlm not installed. Install optional deps: pip install 'dashsplat[mlx]'"
+        ) from e
+
+    if n <= window:
+        chunk = _infer_chunk(model, processor, image_paths, intrinsics, camera_poses)
+        return {
+            **chunk,
+            "backend": "mlx-mapanything",
+            "model_id": mid,
+            "use_nc_weights": use_nc_weights,
+        }
+
     all_pts = None
     all_col = None
     all_conf = None
@@ -151,26 +193,38 @@ def run_mapanything_windows(
         end = min(n, start + window)
         sl = slice(start, end)
         _progress(progress, f"MapAnything window {wi+1}/{len(starts)}…", 0.3 + 0.4 * wi / len(starts))
-        chunk = run_mapanything_mlx(
+        chunk = _infer_chunk(
+            model,
+            processor,
             image_paths[sl],
-            intrinsics=intrinsics[sl],
-            camera_poses=camera_poses[sl],
-            model_id=mid,
-            cache_dir=cache_dir,
-            progress=None,
+            intrinsics[sl],
+            camera_poses[sl],
         )
         if all_pts is None:
-            # Init full buffers from first window sizes
             h, w = chunk["pts3d"].shape[1:3]
             all_pts = np.zeros((n, h, w, 3), dtype=np.float32)
             all_col = np.zeros((n, h, w, 3), dtype=np.float32)
             all_conf = np.zeros((n, h, w), dtype=np.float32)
+        # Resize window maps if shape drifted
         for local_i, global_i in enumerate(range(start, end)):
+            pts = chunk["pts3d"][local_i]
             conf = chunk["conf"][local_i]
+            col = chunk["colors"][local_i]
+            th, tw = all_pts.shape[1:3]
+            if pts.shape[0] != th or pts.shape[1] != tw:
+                # nearest subsample / pad to buffer size
+                ys = np.linspace(0, pts.shape[0] - 1, th).astype(np.int32)
+                xs = np.linspace(0, pts.shape[1] - 1, tw).astype(np.int32)
+                pts = pts[ys][:, xs]
+                conf = conf[ys][:, xs]
+                col = col[ys][:, xs]
             better = conf > all_conf[global_i]
-            all_pts[global_i][better] = chunk["pts3d"][local_i][better]
-            all_col[global_i][better] = chunk["colors"][local_i][better]
+            all_pts[global_i][better] = pts[better]
+            all_col[global_i][better] = col[better]
             all_conf[global_i] = np.maximum(all_conf[global_i], conf)
+        # Drop chunk references promptly
+        del chunk
+
     return {
         "pts3d": all_pts,
         "colors": all_col,
@@ -192,7 +246,6 @@ def voxel_downsample(
     if means.shape[0] == 0:
         return means, colors
     keys = np.floor(means / max(voxel_m, 1e-4)).astype(np.int32)
-    # Hash
     _, unique_idx = np.unique(keys, axis=0, return_index=True)
     means_d = means[unique_idx]
     colors_d = colors[unique_idx]
@@ -234,21 +287,15 @@ def synthetic_pointmap_from_poses(
         z = depth_m * (0.7 + 0.3 * (grid_y / max(h - 1, 1)))
         x = (grid_x - cx) * z / fx
         y = (grid_y - cy) * z / fy
-        cam_pts = np.stack([x, y, z], axis=-1)  # OpenCV cam
+        cam_pts = np.stack([x, y, z], axis=-1)
         R = c2w[:3, :3]
         t = c2w[:3, 3]
         world = cam_pts @ R.T + t
         colors = arr[grid_y, grid_x]
-        # Dense-ish HxW maps for downstream (fill sparse then interpolate-ish by scatter)
-        pts_full = np.zeros((h, w, 3), dtype=np.float32)
-        col_full = np.zeros((h, w, 3), dtype=np.float32)
-        conf = np.zeros((h, w), dtype=np.float32)
-        pts_full[grid_y, grid_x] = world.astype(np.float32)
-        col_full[grid_y, grid_x] = colors
-        conf[grid_y, grid_x] = 1.0
-        pts_list.append(pts_full)
-        col_list.append(col_full)
-        conf_list.append(conf)
+        # Store sparse maps only (not dense HxW) — pack into compact grids
+        pts_list.append(world.astype(np.float32))
+        col_list.append(colors.astype(np.float32))
+        conf_list.append(np.ones(world.shape[:2], dtype=np.float32))
 
     _progress(progress, "Synthetic pointmaps ready", 0.9)
     return {
@@ -272,7 +319,6 @@ def pointmap_to_cloud(
     cols = result["colors"]
     conf = result["conf"]
     mask = conf > conf_thresh
-    # Also drop zero-filled synthetic cells
     mag = np.linalg.norm(pts, axis=-1)
     mask &= mag > 1e-6
     means = pts[mask]

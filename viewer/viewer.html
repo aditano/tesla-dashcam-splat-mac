@@ -295,54 +295,121 @@
       requestAnimationFrame(frame);
     }
 
+    /** Parse PLY header from binary without decoding the whole body as text. */
+    function parsePlyHeader(buf) {
+      const bytes = new Uint8Array(buf);
+      const maxScan = Math.min(bytes.length, 65536);
+      const marker = [0x65,0x6e,0x64,0x5f,0x68,0x65,0x61,0x64,0x65,0x72]; // end_header
+      let headerEnd = -1;
+      for (let i = 0; i + marker.length <= maxScan; i++) {
+        let ok = true;
+        for (let j = 0; j < marker.length; j++) {
+          if (bytes[i + j] !== marker[j]) { ok = false; break; }
+        }
+        if (ok) {
+          let end = i + marker.length;
+          if (end < bytes.length && bytes[end] === 0x0d) end++;
+          if (end < bytes.length && bytes[end] === 0x0a) end++;
+          headerEnd = end;
+          break;
+        }
+      }
+      if (headerEnd < 0) throw new Error('PLY end_header not found');
+      const headerText = new TextDecoder('ascii').decode(bytes.subarray(0, headerEnd));
+      if (!headerText.startsWith('ply')) throw new Error('Not a PLY');
+      const isAscii = /format\s+ascii/i.test(headerText);
+      const little = /binary_little_endian/i.test(headerText);
+      const nMatch = headerText.match(/element\s+vertex\s+(\d+)/i);
+      const n = nMatch ? parseInt(nMatch[1], 10) : 0;
+      const propRe = /property\s+(\w+)\s+(\w+)/gi;
+      const props = [];
+      let m;
+      while ((m = propRe.exec(headerText)) !== null) {
+        props.push({ type: m[1].toLowerCase(), name: m[2] });
+      }
+      const typeSize = {
+        char:1, uchar:1, int8:1, uint8:1,
+        short:2, ushort:2, int16:2, uint16:2,
+        int:4, uint:4, int32:4, uint32:4,
+        float:4, float32:4, double:8, float64:8
+      };
+      let stride = 0;
+      for (const p of props) stride += typeSize[p.type] || 4;
+      return { headerEnd, headerText, isAscii, little, n, props, stride };
+    }
+
+    function readProp(view, off, type, le) {
+      switch (type) {
+        case 'float': case 'float32': return { v: view.getFloat32(off, le), n: 4 };
+        case 'double': case 'float64': return { v: view.getFloat64(off, le), n: 8 };
+        case 'uchar': case 'uint8': case 'char': case 'int8': return { v: view.getUint8(off), n: 1 };
+        case 'ushort': case 'uint16': return { v: view.getUint16(off, le), n: 2 };
+        case 'short': case 'int16': return { v: view.getInt16(off, le), n: 2 };
+        case 'uint': case 'uint32': return { v: view.getUint32(off, le), n: 4 };
+        case 'int': case 'int32': return { v: view.getInt32(off, le), n: 4 };
+        default: return { v: view.getFloat32(off, le), n: 4 };
+      }
+    }
+
     async function loadPLY(url) {
       hud.textContent = 'Loading splat…';
       const res = await fetch(url);
       const buf = await res.arrayBuffer();
-      const textHead = new TextDecoder().decode(buf.slice(0, Math.min(buf.byteLength, 4096)));
-      if (!textHead.startsWith('ply')) throw new Error('Not a PLY');
-      const headerEnd = textHead.indexOf('end_header');
-      const header = textHead.slice(0, headerEnd);
-      const isAscii = /format ascii/i.test(header);
-      const nMatch = header.match(/element vertex (\d+)/);
-      const n = nMatch ? parseInt(nMatch[1], 10) : 0;
-      const props = [...header.matchAll(/property (\w+) (\w+)/g)].map(m => m[2]);
+      const meta = parsePlyHeader(buf);
+      const { n, props, isAscii, little, headerEnd, stride } = meta;
       let positions = new Float32Array(n * 3);
       let colors = new Float32Array(n * 3);
+      const xi = props.findIndex(p => p.name === 'x');
+      const yi = props.findIndex(p => p.name === 'y');
+      const zi = props.findIndex(p => p.name === 'z');
+      const ri = props.findIndex(p => p.name === 'red');
+      const gi = props.findIndex(p => p.name === 'green');
+      const bi = props.findIndex(p => p.name === 'blue');
+      const dc0 = props.findIndex(p => p.name === 'f_dc_0');
+      const dc1 = props.findIndex(p => p.name === 'f_dc_1');
+      const dc2 = props.findIndex(p => p.name === 'f_dc_2');
+      const sh = 0.28209479177387814;
+
       if (isAscii) {
-        const full = new TextDecoder().decode(buf);
-        const body = full.split('end_header')[1].trim().split(/\n/);
+        // Decode only the ASCII body (header already known); large binary PLYs never take this path.
+        const bodyBytes = new Uint8Array(buf, headerEnd);
+        const body = new TextDecoder('ascii').decode(bodyBytes).trim().split(/\n/);
         for (let i = 0; i < n; i++) {
           const p = body[i].trim().split(/\s+/).map(Number);
-          // ENU (e,n,u) → Y-up
-          const e = p[0], nn = p[1], u = p[2];
+          const e = p[xi >= 0 ? xi : 0], nn = p[yi >= 0 ? yi : 1], u = p[zi >= 0 ? zi : 2];
           positions[i*3] = e; positions[i*3+1] = u; positions[i*3+2] = -nn;
-          if (props.includes('red')) {
-            const ri = props.indexOf('red');
-            colors[i*3] = p[ri]/255; colors[i*3+1] = p[ri+1]/255; colors[i*3+2] = p[ri+2]/255;
+          if (ri >= 0) {
+            colors[i*3] = p[ri]/255; colors[i*3+1] = p[gi]/255; colors[i*3+2] = p[bi]/255;
+          } else if (dc0 >= 0) {
+            colors[i*3] = p[dc0]*sh + 0.5;
+            colors[i*3+1] = p[dc1]*sh + 0.5;
+            colors[i*3+2] = p[dc2]*sh + 0.5;
           } else {
             colors[i*3] = colors[i*3+1] = colors[i*3+2] = 0.8;
           }
         }
       } else {
-        const bytes = new Uint8Array(buf);
-        const asStr = new TextDecoder().decode(bytes);
-        const idx = asStr.indexOf('end_header\n');
-        let off = idx >= 0 ? idx + 'end_header\n'.length : 0;
-        const view = new DataView(buf, off);
-        const hasDC = props.includes('f_dc_0');
-        const strideFloats = hasDC ? 17 : (props.includes('red') ? 6 : 3);
+        // Binary: walk property list with real sizes — works for Brush/msplat/seeded layouts.
+        const view = new DataView(buf, headerEnd);
         for (let i = 0; i < n; i++) {
-          const base = i * strideFloats * 4;
-          const e = view.getFloat32(base, true);
-          const nn = view.getFloat32(base + 4, true);
-          const u = view.getFloat32(base + 8, true);
+          let off = i * stride;
+          const vals = new Array(props.length);
+          for (let pi = 0; pi < props.length; pi++) {
+            const r = readProp(view, off, props[pi].type, little);
+            vals[pi] = r.v;
+            off += r.n;
+          }
+          const e = vals[xi >= 0 ? xi : 0];
+          const nn = vals[yi >= 0 ? yi : 1];
+          const u = vals[zi >= 0 ? zi : 2];
           positions[i*3] = e; positions[i*3+1] = u; positions[i*3+2] = -nn;
-          if (hasDC) {
-            const sh = 0.28209479177387814;
-            colors[i*3] = view.getFloat32(base + 24, true) * sh + 0.5;
-            colors[i*3+1] = view.getFloat32(base + 28, true) * sh + 0.5;
-            colors[i*3+2] = view.getFloat32(base + 32, true) * sh + 0.5;
+          if (dc0 >= 0) {
+            colors[i*3] = vals[dc0]*sh + 0.5;
+            colors[i*3+1] = vals[dc1]*sh + 0.5;
+            colors[i*3+2] = vals[dc2]*sh + 0.5;
+          } else if (ri >= 0) {
+            const scale = (props[ri].type === 'float' || props[ri].type === 'float32') ? 1 : 1/255;
+            colors[i*3] = vals[ri]*scale; colors[i*3+1] = vals[gi]*scale; colors[i*3+2] = vals[bi]*scale;
           } else {
             colors[i*3] = colors[i*3+1] = colors[i*3+2] = 0.85;
           }

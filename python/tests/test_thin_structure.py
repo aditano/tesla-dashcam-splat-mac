@@ -74,23 +74,11 @@ def test_thin_branch_max_scale_and_sharpness_improve(tmp_path: Path):
     combo = Image.new("RGB", (512, 256))
     combo.paste(before, (0, 0))
     combo.paste(after, (256, 0))
+    # Always write under pytest tmp only — never docs/screenshots or the repo tree.
     before.save(tmp_path / "trees-before-clumpy.png")
     after.save(tmp_path / "trees-after-thin.png")
     combo.save(tmp_path / "trees-before-after.png")
-    docs = Path(__file__).resolve().parents[2] / "docs" / "screenshots"
-    if docs.is_dir():
-        combo.save(docs / "trees-before-after.png")
 
-    agent_out = Path("/opt/cursor/artifacts")
-    try:
-        agent_out.mkdir(parents=True, exist_ok=True)
-        before.save(agent_out / "trees-before-clumpy.png")
-        after.save(agent_out / "trees-after-thin.png")
-        combo.save(agent_out / "trees-before-after.png")
-    except OSError:
-        pass  # GitHub Actions runners cannot write /opt/cursor
-
-    # Write metrics JSON for the report
     import json
 
     metrics = {
@@ -107,9 +95,5 @@ def test_thin_branch_max_scale_and_sharpness_improve(tmp_path: Path):
         "sources": list(DetailQuality.SOURCES),
     }
     (tmp_path / "trees-metrics.json").write_text(json.dumps(metrics, indent=2))
-    try:
-        (agent_out / "trees-metrics.json").write_text(json.dumps(metrics, indent=2))
-    except OSError:
-        pass
     assert metrics["new_skeleton_precision"] > metrics["old_skeleton_precision"]
     assert metrics["new_psnr_proxy_db"] > metrics["old_psnr_proxy_db"]

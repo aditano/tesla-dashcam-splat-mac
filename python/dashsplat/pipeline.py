@@ -159,19 +159,21 @@ def build_event(
     )
     stage_t["ingest_sec"] = time.time() - t_stage
 
-    # --- frames (all 4 cameras) ---
+    # --- frames (all cameras, all clips in the event) ---
     t_stage = time.time()
     max_frames = max_frames_per_camera or budget.max_frames_per_camera
-    # For smoke/CI keep small; callers can override
-    _emit(progress, "Extracting frames (all cameras)…", 0.12, stage="keyframes")
+    _emit(progress, "Extracting frames (all cameras/clips)…", 0.12, stage="keyframes")
     check()
-    save_offsets(out_dir / "timing_offsets.json", dict(DEFAULT_OFFSETS_SEC))
+    offsets_path = out_dir / "timing_offsets.json"
+    # Do not clobber calibrated offsets from a prior run
+    if not offsets_path.exists():
+        save_offsets(offsets_path, dict(DEFAULT_OFFSETS_SEC))
     images, Ks, c2ws, cameras, decode_report = extract_event_frames(
         event,
         out_dir,
         traj.poses,
         max_frames_per_camera=min(max_frames, 24) if force_fallback_trainer else max_frames,
-        offsets_path=out_dir / "timing_offsets.json",
+        offsets_path=offsets_path,
         host=host,
         parallel_cameras=tuned.decode_parallel_cameras,
         progress=progress,
@@ -180,31 +182,26 @@ def build_event(
     if not images:
         return {"ok": False, "exit_code": 3, "error": "no frames extracted", "event_id": event.id}
 
-    # Per-camera color/exposure match to front (one representative frame each)
-    _emit(progress, "Matching per-camera color…", 0.18, stage="color")
-    reps: dict[str, Path] = {}
-    for cam in cameras:
-        cid = cam["camera"]
-        if cid not in reps:
-            reps[cid] = Path(cam["file_path"])
-    if reps:
-        affines = match_cameras_to_front(reps, out_dir / "color_matched")
-        (out_dir / "color_affines.json").write_text(json.dumps(affines, indent=2))
-        # Remap all frames of each camera with the fitted affine when available
-        by_cam: dict[str, list[int]] = {}
+    # Distance-based keyframe indices — filter extracted frames to those poses
+    key_idx = select_keyframes(
+        traj.poses,
+        cameras=event.cameras or ["front"],
+        tier=budget.name,
+    )
+    (out_dir / "keyframes.json").write_text(json.dumps(key_idx, indent=2))
+    if traj.poses and any(key_idx.values()):
+        keep: list[int] = []
         for i, cam in enumerate(cameras):
-            by_cam.setdefault(cam["camera"], []).append(i)
-        for cid, idxs in by_cam.items():
-            aff = affines.get(cid)
-            if not aff or cid == "front":
-                continue
-            scale = np.array(aff["scale"], dtype=np.float64)
-            bias = np.array(aff["bias"], dtype=np.float64)
-            for i in idxs:
-                p = Path(cameras[i]["file_path"])
-                img = np.asarray(Image.open(p).convert("RGB"))
-                matched = apply_affine(img, scale, bias)
-                Image.fromarray(matched).save(p, quality=92)
+            t = float(cam.get("time_sec", 0.0))
+            pidx = min(range(len(traj.poses)), key=lambda j: abs(traj.poses[j].time_sec - t))
+            allowed = key_idx.get(cam["camera"]) or key_idx.get("front") or []
+            if not allowed or pidx in allowed:
+                keep.append(i)
+        if keep:
+            images = [images[i] for i in keep]
+            Ks = [Ks[i] for i in keep]
+            c2ws = [c2ws[i] for i in keep]
+            cameras = [cameras[i] for i in keep]
 
     # --- ego 3D proxy (path-following GLB; fills masked ego region in viewer) ---
     _emit(progress, "Exporting ego vehicle path…", 0.20, stage="ego")
@@ -214,17 +211,9 @@ def build_event(
         "n_samples": ego_export.get("n_samples"),
         "model_id": (ego_export.get("manifest") or {}).get("model_id"),
     }
-
-    # Distance-based selection indices into trajectory, applied as a filter on cameras list
-    key_idx = select_keyframes(
-        traj.poses,
-        cameras=event.cameras or ["front"],
-        tier=budget.name,
-    )
-    (out_dir / "keyframes.json").write_text(json.dumps(key_idx, indent=2))
     stage_t["keyframes_sec"] = time.time() - t_stage
 
-    # --- tiles ---
+    # --- tiles (used for Full multi-pass training below) ---
     tiles = split_route_tiles(traj.poses, tier=budget.name)
     (out_dir / "tiles.json").write_text(
         json.dumps(
@@ -233,7 +222,13 @@ def build_event(
         )
     )
 
-    # --- masks ---
+    def _speed_at(time_sec: float) -> float:
+        if not traj.poses:
+            return 0.0
+        pidx = min(range(len(traj.poses)), key=lambda i: abs(traj.poses[i].time_sec - time_sec))
+        return float(traj.poses[pidx].speed_mps)
+
+    # --- masks (before color match so stats ignore ego/sky/movers) ---
     t_stage = time.time()
     _emit(progress, "Building masks (ego/sky/movers)…", 0.25, stage="masks")
     check()
@@ -242,9 +237,7 @@ def build_event(
             "path": c["file_path"],
             "camera": c["camera"],
             "file_name": c["file_name"],
-            "speed_mps": c.get("time_sec", 0) and traj.poses[min(int(c.get("time_sec", 0)), len(traj.poses) - 1)].speed_mps
-            if traj.poses
-            else 0.0,
+            "speed_mps": _speed_at(float(c.get("time_sec", 0.0))),
         }
         for c in cameras
     ]
@@ -257,6 +250,45 @@ def build_event(
     )
     stage_devices["masks"] = mask_devices
     stage_t["masks_sec"] = time.time() - t_stage
+
+    # Per-camera color match AFTER masks; writes copies (never overwrites originals)
+    _emit(progress, "Matching per-camera color…", 0.28, stage="color")
+    reps: dict[str, Path] = {}
+    mask_reps: dict[str, Path] = {}
+    for cam in cameras:
+        cid = cam["camera"]
+        if cid not in reps:
+            reps[cid] = Path(cam["file_path"])
+            stem = Path(cam["file_name"]).stem
+            for ext in (".png", ".jpg"):
+                cand = masks_dir / f"{stem}{ext}"
+                if cand.exists():
+                    mask_reps[cid] = cand
+                    break
+    if reps:
+        affines = match_cameras_to_front(
+            reps, out_dir / "color_matched", masks=mask_reps or None
+        )
+        (out_dir / "color_affines.json").write_text(json.dumps(affines, indent=2))
+        by_cam: dict[str, list[int]] = {}
+        for i, cam in enumerate(cameras):
+            by_cam.setdefault(cam["camera"], []).append(i)
+        matched_dir = out_dir / "color_matched"
+        matched_dir.mkdir(parents=True, exist_ok=True)
+        for cid, idxs in by_cam.items():
+            aff = affines.get(cid)
+            if not aff or cid == "front":
+                continue
+            scale = np.array(aff["scale"], dtype=np.float64)
+            bias = np.array(aff["bias"], dtype=np.float64)
+            for i in idxs:
+                p = Path(cameras[i]["file_path"])
+                img = np.asarray(Image.open(p).convert("RGB"))
+                matched = apply_affine(img, scale, bias)
+                dest = matched_dir / Path(cameras[i]["file_name"]).name
+                Image.fromarray(matched).save(dest, quality=92)
+                cameras[i]["file_path"] = str(dest)
+                images[i] = dest
 
     # --- MapAnything ---
     t_stage = time.time()
@@ -294,7 +326,7 @@ def build_event(
     )
     stage_t["geometry_sec"] = time.time() - t_stage
 
-    # --- train (per tile in Full; single pass Preview) ---
+    # --- train (per tile in Full when route is long enough; single pass Preview) ---
     t_stage = time.time()
     iters = train_iters
     splat_cap = max(tuned.max_splats, veg_splats)
@@ -307,26 +339,134 @@ def build_event(
         eta_sec=max(0.0, budget.eta_prior_sec - (time.time() - t0)),
     )
     check()
-    train_result = train_splat(
-        means,
-        colors,
-        cameras,
-        out_dir,
-        iterations=iters,
-        max_splats=splat_cap,
-        masks_dir=masks_dir,
-        trainer_name=trainer_name,
-        force_fallback=force_fallback_trainer,
-        detail=detail.trainer_extra(),
-        progress=progress,
-    )
-    # Flag silent CPU trainer when Apple Silicon expected Metal
+
+    def _cameras_for_tile(tile_pose_indices: list[int]) -> list[dict[str, Any]]:
+        if not traj.poses or not tile_pose_indices:
+            return cameras
+        allowed = set(tile_pose_indices)
+        out: list[dict[str, Any]] = []
+        for c in cameras:
+            t = float(c.get("time_sec", 0.0))
+            pidx = min(range(len(traj.poses)), key=lambda i: abs(traj.poses[i].time_sec - t))
+            if pidx in allowed:
+                out.append(c)
+        return out or cameras
+
+    def _means_for_tile(tile) -> tuple[np.ndarray, np.ndarray]:
+        """Keep points whose ground projection falls near poses in this tile."""
+        if means.shape[0] == 0 or not traj.poses or len(tiles) <= 1:
+            return means, colors
+        idxs = tile.pose_indices
+        xs = np.array([traj.poses[i].position[0] for i in idxs], dtype=np.float64)
+        ys = np.array([traj.poses[i].position[1] for i in idxs], dtype=np.float64)
+        pad = 25.0
+        xmin, xmax = float(xs.min()) - pad, float(xs.max()) + pad
+        ymin, ymax = float(ys.min()) - pad, float(ys.max()) + pad
+        mask = (
+            (means[:, 0] >= xmin)
+            & (means[:, 0] <= xmax)
+            & (means[:, 1] >= ymin)
+            & (means[:, 1] <= ymax)
+        )
+        if not np.any(mask):
+            return means, colors
+        return means[mask], colors[mask]
+
+    use_tiles = budget.name == QualityTier.FULL and len(tiles) > 1
+    if use_tiles:
+        tile_results = []
+        all_means = []
+        all_colors = []
+        for tile in tiles:
+            check()
+            t_cams = _cameras_for_tile(tile.pose_indices)
+            t_means, t_colors = _means_for_tile(tile)
+            tile_dir = out_dir / f"tile_{tile.index:03d}"
+            _emit(
+                progress,
+                f"Training tile {tile.index + 1}/{len(tiles)} ({len(t_cams)} cams)…",
+                0.6 + 0.3 * tile.index / len(tiles),
+                stage="train",
+            )
+            tr = train_splat(
+                t_means,
+                t_colors,
+                t_cams,
+                tile_dir,
+                iterations=iters,
+                max_splats=max(10_000, splat_cap // max(len(tiles), 1)),
+                masks_dir=masks_dir,
+                trainer_name=trainer_name,
+                force_fallback=force_fallback_trainer,
+                detail=detail.trainer_extra(),
+                progress=progress,
+            )
+            tile_results.append(tr)
+            all_means.append(t_means)
+            all_colors.append(t_colors)
+        # Prefer last non-seeded Metal tile; else merge means for a seeded export
+        metal = [r for r in tile_results if r.get("trainer") != "seeded"]
+        if metal:
+            train_result = metal[-1]
+            # Copy winning PLY to out_dir root for the app
+            src_ply = Path(train_result["ply"]) if train_result.get("ply") else None
+            if src_ply and src_ply.exists():
+                dest = out_dir / "splat.ply"
+                if src_ply.resolve() != dest.resolve():
+                    dest.write_bytes(src_ply.read_bytes())
+                train_result = {**train_result, "ply": str(dest)}
+        else:
+            merged_m = np.concatenate(all_means, axis=0) if all_means else means
+            merged_c = np.concatenate(all_colors, axis=0) if all_colors else colors
+            train_result = train_splat(
+                merged_m,
+                merged_c,
+                cameras,
+                out_dir,
+                iterations=iters,
+                max_splats=splat_cap,
+                masks_dir=masks_dir,
+                trainer_name="seeded",
+                force_fallback=True,
+                detail=detail.trainer_extra(),
+                progress=progress,
+            )
+            train_result = {**train_result, "n_tiles_trained": len(tile_results)}
+        train_result["n_tiles_trained"] = len(tile_results)
+    else:
+        train_result = train_splat(
+            means,
+            colors,
+            cameras,
+            out_dir,
+            iterations=iters,
+            max_splats=splat_cap,
+            masks_dir=masks_dir,
+            trainer_name=trainer_name,
+            force_fallback=force_fallback_trainer,
+            detail=detail.trainer_extra(),
+            progress=progress,
+        )
+    # Surface which trainer actually produced the PLY (never claim Full Metal for CPU)
     actual_trainer = train_result.get("trainer")
-    if host.is_apple_silicon and actual_trainer == "seeded" and not force_fallback_trainer:
-        stage_devices["train_warning"] = "Metal trainer unavailable; used seeded CPU fallback"
+    cpu_fallback = bool(train_result.get("cpu_fallback")) or (
+        actual_trainer == "seeded" and not force_fallback_trainer
+    )
+    train_warning = None
+    if cpu_fallback:
+        train_warning = (
+            f"Seeded CPU fallback used (requested {trainer_name or 'brush'}; "
+            f"fallback_from={train_result.get('fallback_from')}). "
+            "Not a Metal Full success."
+        )
+        stage_devices["train_warning"] = train_warning
+        _emit(progress, train_warning, 0.96, stage="train")
     stage_devices["train"] = {
         "preferred": train_dev,
         "trainer": actual_trainer,
+        "cpu_fallback": cpu_fallback,
+        "fallback_from": train_result.get("fallback_from"),
+        "fallback_errors": train_result.get("fallback_errors"),
     }
     stage_t["train_sec"] = time.time() - t_stage
     (out_dir / "devices.json").write_text(json.dumps(stage_devices, indent=2))
@@ -343,13 +483,15 @@ def build_event(
         "trajectory_source": traj.source,
         "pointmap_backend": pointmap.get("backend"),
         "trainer": train_result.get("trainer"),
+        "cpu_fallback": cpu_fallback,
+        "fallback_from": train_result.get("fallback_from"),
         "ply": train_result.get("ply"),
         "spz": train_result.get("spz"),
         "cameras": str(out_dir / "cameras.json"),
         "masks": str(masks_dir),
         "num_gaussians": train_result.get("num_gaussians") or int(means.shape[0]),
         "n_tiles": len(tiles),
-        "warning": traj.warning or health.message,
+        "warning": train_warning or traj.warning or health.message,
         "has_sei": health.has_sei,
         "eta_prior_sec": budget.eta_prior_sec,
         "hw_generation": hw.generation.value,

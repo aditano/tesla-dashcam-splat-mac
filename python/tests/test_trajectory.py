@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
+
+from dashsplat.cameras import CAMERA_RIG
 from dashsplat.sei import SeiSample
 from dashsplat.trajectory import (
+    Pose,
+    apply_vehicle_camera_offset,
     build_trajectory_from_sei,
     create_enu_origin,
     heading_deg_to_enu_yaw,
@@ -58,3 +63,70 @@ def test_fallback_without_gps():
     assert traj.source == "filename-fallback"
     assert traj.warning
     assert len(traj.poses) >= 2
+
+
+def test_c2w_right_vector_faces_east_when_heading_north():
+    """Facing north (heading 0° → ENU yaw +90°): right column must be +east."""
+    pose = Pose(time_sec=0, position=(0, 0, 0), yaw_rad=heading_deg_to_enu_yaw(0.0), heading_deg=0, speed_mps=0)
+    c2w = np.asarray(pose.c2w_matrix(), dtype=np.float64)
+    right = c2w[:3, 0]
+    forward = c2w[:3, 2]
+    # forward ≈ north (+Y), right ≈ east (+X)
+    assert forward[1] > 0.9
+    assert right[0] > 0.9
+    assert abs(right[1]) < 0.1
+
+
+def test_left_repeater_forward_has_positive_left_component():
+    """Left repeater on +Y body must look left/rearward (west when vehicle north)."""
+    vehicle = Pose(
+        time_sec=0,
+        position=(0, 0, 0),
+        yaw_rad=heading_deg_to_enu_yaw(0.0),
+        heading_deg=0,
+        speed_mps=0,
+    )
+    cam = CAMERA_RIG["left_repeater"]
+    cam_pose = apply_vehicle_camera_offset(vehicle, cam.position, cam.rotation_deg[1])
+    c2w = np.asarray(cam_pose.c2w_matrix(z=cam.position[2]), dtype=np.float64)
+    forward = c2w[:3, 2]
+    # Vehicle north: left = west = −east. Forward should have negative east and rearward (−north).
+    assert forward[0] < 0.0, f"left camera forward east component should be <0, got {forward}"
+    assert forward[1] < 0.0, f"left camera should be rear-biased, got {forward}"
+
+
+def test_right_repeater_forward_has_negative_left_component():
+    vehicle = Pose(
+        time_sec=0,
+        position=(0, 0, 0),
+        yaw_rad=heading_deg_to_enu_yaw(0.0),
+        heading_deg=0,
+        speed_mps=0,
+    )
+    cam = CAMERA_RIG["right_repeater"]
+    cam_pose = apply_vehicle_camera_offset(vehicle, cam.position, cam.rotation_deg[1])
+    c2w = np.asarray(cam_pose.c2w_matrix(z=cam.position[2]), dtype=np.float64)
+    forward = c2w[:3, 2]
+    # Right = east = +X when facing north; rear-biased → −north
+    assert forward[0] > 0.0, f"right camera forward east component should be >0, got {forward}"
+    assert forward[1] < 0.0
+
+
+def test_pillar_yaws_face_outward():
+    vehicle = Pose(
+        time_sec=0,
+        position=(0, 0, 0),
+        yaw_rad=heading_deg_to_enu_yaw(0.0),
+        heading_deg=0,
+        speed_mps=0,
+    )
+    left = apply_vehicle_camera_offset(
+        vehicle, CAMERA_RIG["left_pillar"].position, CAMERA_RIG["left_pillar"].rotation_deg[1]
+    )
+    right = apply_vehicle_camera_offset(
+        vehicle, CAMERA_RIG["right_pillar"].position, CAMERA_RIG["right_pillar"].rotation_deg[1]
+    )
+    lf = np.asarray(left.c2w_matrix(), dtype=np.float64)[:3, 2]
+    rf = np.asarray(right.c2w_matrix(), dtype=np.float64)[:3, 2]
+    assert lf[0] < 0.0  # left pillar → west
+    assert rf[0] > 0.0  # right pillar → east
