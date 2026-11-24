@@ -104,23 +104,45 @@ def select_keyframes(
 
     hard = hard_turn_indices(poses, max_yaw_rate)
 
+    total_m = cum[-1] if cum else 0.0
+    # Eligible indices (not hard-turn / not blurry)
     out: dict[str, list[int]] = {}
     for cam in cams:
-        chosen: list[int] = []
-        next_dist = 0.0
         blur_map = (blur_scores or {}).get(cam) or {}
-        for i, d in enumerate(cum):
-            if i in hard:
-                continue
-            if blur_map and blur_map.get(i, 1.0) < min_blur_score:
-                continue
-            if d + 1e-6 < next_dist and chosen:
-                continue
-            chosen.append(i)
-            next_dist = d + budget.meters_per_keyframe
-            if len(chosen) >= budget.max_frames_per_camera:
+        eligible = [
+            i
+            for i in range(len(poses))
+            if i not in hard and not (blur_map and blur_map.get(i, 1.0) < min_blur_score)
+        ]
+        if not eligible:
+            out[cam] = [0]
+            continue
+        # Ideal count from spacing, then cap — spread uniformly over the WHOLE route
+        if total_m <= 0:
+            n_want = 1
+        else:
+            n_want = int(math.floor(total_m / max(budget.meters_per_keyframe, 1e-3))) + 1
+        n_want = max(1, min(budget.max_frames_per_camera, n_want, len(eligible)))
+        if n_want == 1:
+            # Mid-route pick
+            mid = eligible[len(eligible) // 2]
+            out[cam] = [mid]
+            continue
+        targets = [i * total_m / (n_want - 1) for i in range(n_want)]
+        chosen: list[int] = []
+        used: set[int] = set()
+        for t in targets:
+            best = min(
+                (i for i in eligible if i not in used),
+                key=lambda i: abs(cum[i] - t),
+                default=None,
+            )
+            if best is None:
                 break
+            chosen.append(best)
+            used.add(best)
+        chosen.sort()
         if not chosen:
-            chosen = [0]
+            chosen = [eligible[0]]
         out[cam] = chosen
     return out

@@ -49,7 +49,7 @@ def fit_affine_rgb(
         ys_mean, ys_std = float(ys.mean()), float(ys.std()) + 1e-6
         # Clamp scale so a dark/bright outlier frame cannot explode the match
         scales[c] = float(np.clip(ys_std / xs_std, 0.25, 4.0))
-        biases[c] = ys_mean - scales[c] * xs_mean
+        biases[c] = float(np.clip(ys_mean - scales[c] * xs_mean, -64.0, 64.0))
     return scales, biases
 
 
@@ -179,7 +179,7 @@ def match_cameras_to_front(
         else:
             src_mean, src_std = _channel_stats(paths, cam_mask_path)
             scale = np.clip(front_std / np.maximum(src_std, 1e-6), 0.25, 4.0)
-            bias = front_mean - scale * src_mean
+            bias = np.clip(front_mean - scale * src_mean, -64.0, 64.0)
             matched = apply_affine(img, scale, bias)
         dest = out_dir / paths[0].name
         Image.fromarray(matched).save(dest, quality=92)

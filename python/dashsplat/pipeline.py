@@ -13,7 +13,6 @@ from PIL import Image
 from dashsplat.accel.device import (
     detect_host,
     preferred_coreml_units,
-    preferred_mlx_device,
     preferred_train_device,
 )
 from dashsplat.accel.tune import tune_for_host
@@ -34,7 +33,12 @@ from dashsplat.mapanything import (
     voxel_downsample,
 )
 from dashsplat.masks.pipeline import build_masks_for_frames
-from dashsplat.export import merge_gaussian_plies, write_gaussian_ply
+from dashsplat.export import (
+    merge_cameras_json,
+    merge_gaussian_plies,
+    write_cameras_json,
+    write_gaussian_ply,
+)
 from dashsplat.sei import extract_sei_from_event
 from dashsplat.tiers import QualityTier, budget_for
 from dashsplat.tiles import split_route_tiles
@@ -260,21 +264,43 @@ def build_event(
     )
     stage_devices["masks"] = mask_devices
     stage_t["masks_sec"] = time.time() - t_stage
+    # Raw frame-differencing movers stay disabled while driving (would blank scene);
+    # surface that so Full builds don't silently claim mover masking ran.
+    mover_warning = (
+        "Mover masking disabled while driving (no ego-motion compensation); "
+        "static scene is kept. RF-DETR path used only when available."
+    )
+    stage_devices["movers_warning"] = mover_warning
 
     # Per-camera color match AFTER masks; writes copies (never overwrites originals)
     _emit(progress, "Matching per-camera color…", 0.28, stage="color")
     reps: dict[str, list[Path]] = {}
-    mask_reps: dict[str, Path] = {}
+    mask_lists: dict[str, list[Path]] = {}
     for cam in cameras:
         cid = cam["camera"]
         reps.setdefault(cid, []).append(Path(cam["file_path"]))
-        if cid not in mask_reps:
-            stem = Path(cam["file_name"]).stem
-            for ext in (".png", ".jpg"):
-                cand = masks_dir / f"{stem}{ext}"
-                if cand.exists():
-                    mask_reps[cid] = cand
-                    break
+        stem = Path(cam["file_name"]).stem
+        for ext in (".png", ".jpg"):
+            cand = masks_dir / f"{stem}{ext}"
+            if cand.exists():
+                mask_lists.setdefault(cid, []).append(cand)
+                break
+    # Merge all per-camera masks into one OR-combined mask for stats
+    mask_reps: dict[str, Path] = {}
+    for cid, paths in mask_lists.items():
+        if len(paths) == 1:
+            mask_reps[cid] = paths[0]
+            continue
+        from PIL import Image as _Image
+
+        acc = None
+        for mp in paths:
+            m = np.asarray(_Image.open(mp).convert("L"))
+            acc = m if acc is None else np.maximum(acc, m)
+        merged_mask_path = out_dir / "color_matched_masks" / f"{cid}_merged.png"
+        merged_mask_path.parent.mkdir(parents=True, exist_ok=True)
+        _Image.fromarray(acc.astype(np.uint8)).save(merged_mask_path)
+        mask_reps[cid] = merged_mask_path
     if reps:
         affines = match_cameras_to_front(
             reps, out_dir / "color_matched", masks=mask_reps or None
@@ -300,18 +326,26 @@ def build_event(
                 cameras[i]["file_path"] = str(dest)
                 images[i] = dest
 
-    # --- MapAnything ---
+    # --- MapAnything (official PyTorch facebookresearch/map-anything on MPS/CPU) ---
     t_stage = time.time()
-    mlx_dev = preferred_mlx_device(host).value
-    _emit(progress, f"MapAnything geometry ({mlx_dev})…", 0.4, stage="geometry")
+    _emit(progress, "MapAnything geometry (PyTorch MPS/CPU)…", 0.4, stage="geometry")
     check()
     pointmap = None
     geom_device = "synthetic_cpu"
+    # use_mlx flag historically gated geometry; keep as "try real MapAnything" switch
     if use_mlx:
         try:
-            model_dir = support_layout()["models"] / (
-                "map-anything-fp16" if use_nc_mapanything else "map-anything-apache-fp16"
+            models_root = support_layout()["models"]
+            model_dir = models_root / (
+                "facebook-map-anything" if use_nc_mapanything else "facebook-map-anything-apache"
             )
+            # Also accept legacy mlx cache dir names if a HF snapshot was placed there
+            if not model_dir.exists():
+                legacy = models_root / (
+                    "map-anything-fp16" if use_nc_mapanything else "map-anything-apache-fp16"
+                )
+                if legacy.exists():
+                    model_dir = legacy
             pointmap = run_mapanything_windows(
                 images,
                 Ks,
@@ -322,7 +356,7 @@ def build_event(
                 cache_dir=model_dir if model_dir.exists() else None,
                 progress=progress,
             )
-            geom_device = mlx_dev
+            geom_device = pointmap.get("device") or pointmap.get("backend") or "torch"
         except Exception as e:
             _emit(progress, f"MapAnything unavailable ({e}); synthetic fallback", 0.42, stage="geometry")
     if pointmap is None:
@@ -330,10 +364,14 @@ def build_event(
         geom_device = "synthetic_cpu"
     stage_devices["geometry"] = geom_device
     geom_warning = None
-    if pointmap.get("backend") in ("synthetic-fallback", "synthetic_cpu") or geom_device == "synthetic_cpu":
-        geom_warning = (
+    if (
+        pointmap.get("backend") in ("synthetic-fallback", "synthetic_cpu")
+        or geom_device == "synthetic_cpu"
+        or pointmap.get("warning")
+    ):
+        geom_warning = pointmap.get("warning") or (
             "MapAnything unavailable — using synthetic flat-plane geometry fallback. "
-            "Splat quality will be low until MLX MapAnything weights load."
+            "Splat quality will be low until facebook/map-anything-apache weights load."
         )
         stage_devices["geometry_warning"] = geom_warning
         _emit(progress, geom_warning, 0.45, stage="geometry")
@@ -362,8 +400,9 @@ def build_event(
     check()
 
     def _cameras_for_tile(tile_pose_indices: list[int]) -> list[dict[str, Any]]:
+        """Cameras whose nearest pose is in this tile. Empty → skip tile (no all-cam fallback)."""
         if not traj.poses or not tile_pose_indices:
-            return cameras
+            return []
         allowed = set(tile_pose_indices)
         out: list[dict[str, Any]] = []
         for c in cameras:
@@ -371,7 +410,7 @@ def build_event(
             pidx = min(range(len(traj.poses)), key=lambda i: abs(traj.poses[i].time_sec - t))
             if pidx in allowed:
                 out.append(c)
-        return out or cameras
+        return out
 
     def _means_for_tile(tile) -> tuple[np.ndarray, np.ndarray]:
         """Keep points whose ground projection falls near poses in this tile."""
@@ -397,11 +436,20 @@ def build_event(
     if use_tiles:
         tile_results = []
         tile_plys: list[Path] = []
+        tile_cam_jsons: list[Path] = []
         all_means = []
         all_colors = []
         for tile in tiles:
             check()
             t_cams = _cameras_for_tile(tile.pose_indices)
+            if not t_cams:
+                _emit(
+                    progress,
+                    f"Skipping tile {tile.index + 1}/{len(tiles)} (no cameras in range)",
+                    0.6 + 0.3 * tile.index / len(tiles),
+                    stage="train",
+                )
+                continue
             t_means, t_colors = _means_for_tile(tile)
             tile_dir = out_dir / f"tile_{tile.index:03d}"
             _emit(
@@ -428,18 +476,30 @@ def build_event(
             all_colors.append(t_colors)
             if tr.get("ply") and Path(tr["ply"]).exists():
                 tile_plys.append(Path(tr["ply"]))
+            cam_json = tile_dir / "cameras.json"
+            if cam_json.exists():
+                tile_cam_jsons.append(cam_json)
+            elif tr.get("cameras") and Path(tr["cameras"]).exists():
+                tile_cam_jsons.append(Path(tr["cameras"]))
         # Merge ALL tile outputs into one world-frame PLY (do not keep only the last tile)
         dest = out_dir / "splat.ply"
+        root_cams = out_dir / "cameras.json"
+        if tile_cam_jsons:
+            merge_cameras_json(tile_cam_jsons, root_cams)
+        else:
+            write_cameras_json(root_cams, cameras)
         if tile_plys:
-            merge_gaussian_plies(tile_plys, dest, voxel_m=0.05, max_points=splat_cap)
+            _, n_gauss = merge_gaussian_plies(
+                tile_plys, dest, voxel_m=0.05, max_points=splat_cap
+            )
             trainers_used = [r.get("trainer") for r in tile_results]
             train_result = {
                 "trainer": trainers_used[-1],
                 "ply": str(dest),
                 "spz": None,
-                "cameras": str(out_dir / "cameras.json"),
+                "cameras": str(root_cams),
                 "exit_code": 0,
-                "num_gaussians": None,
+                "num_gaussians": int(n_gauss),
                 "n_tiles_trained": len(tile_results),
                 "tile_trainers": trainers_used,
                 "cpu_fallback": all(t == "seeded" for t in trainers_used),
@@ -461,7 +521,12 @@ def build_event(
                 detail=detail.trainer_extra(),
                 progress=progress,
             )
-            train_result = {**train_result, "n_tiles_trained": len(tile_results)}
+            train_result = {
+                **train_result,
+                "n_tiles_trained": len(tile_results),
+                "num_gaussians": int(merged_m.shape[0]),
+                "cameras": str(root_cams),
+            }
         train_result["n_tiles_trained"] = len(tile_results)
     else:
         train_result = train_splat(
@@ -519,11 +584,14 @@ def build_event(
         "spz": train_result.get("spz"),
         "cameras": str(out_dir / "cameras.json"),
         "masks": str(masks_dir),
-        "num_gaussians": train_result.get("num_gaussians") or int(means.shape[0]),
+        "num_gaussians": train_result.get("num_gaussians")
+        if train_result.get("num_gaussians") is not None
+        else int(means.shape[0]),
         "n_tiles": len(tiles),
         "warning": train_warning
         or geom_warning
         or decode_report.get("warning")
+        or mover_warning
         or traj.warning
         or health.message,
         "pointmap_synthetic": bool(geom_warning),
