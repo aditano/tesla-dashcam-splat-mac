@@ -134,16 +134,21 @@ class BrushTrainer:
             progress("Training with Brush (Metal)…", 0.4)
         out_dir.mkdir(parents=True, exist_ok=True)
         export_dir = out_dir / "brush_export"
+        # Clear prior exports so a failed/partial run cannot leave a stale PLY
+        if export_dir.exists():
+            shutil.rmtree(export_dir)
         export_dir.mkdir(parents=True, exist_ok=True)
         export_name = "splat.ply"
         ply = out_dir / "splat.ply"
         detail_path = out_dir / "trainer_detail.json"
         detail_path.write_text(json.dumps(config.detail or {}, indent=2))
 
+        # Always recopy masks every run (stale masks from a prior refine are wrong)
         if config.masks_dir and config.masks_dir.exists():
             dest = project_dir / "masks"
-            if not dest.exists():
-                shutil.copytree(config.masks_dir, dest, dirs_exist_ok=True)
+            if dest.exists():
+                shutil.rmtree(dest)
+            shutil.copytree(config.masks_dir, dest, dirs_exist_ok=True)
 
         cmd = build_brush_argv(
             brush,

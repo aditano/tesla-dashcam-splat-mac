@@ -22,11 +22,42 @@ def find_msplat_cli() -> Path | None:
     return Path(which) if which else None
 
 
+def msplat_trainer_works() -> bool:
+    """True only if a working trainer entrypoint responds (not merely importable)."""
+    cli = find_msplat_cli()
+    if cli is not None:
+        try:
+            proc = subprocess.run(
+                [str(cli), "--help"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            if proc.returncode == 0 or "usage" in (proc.stdout + proc.stderr).lower():
+                return True
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    if not msplat_importable():
+        return False
+    try:
+        import msplat  # type: ignore
+
+        # Prefer an explicit train/run hook if present
+        for attr in ("train", "run", "main", "Trainer"):
+            if hasattr(msplat, attr):
+                return True
+        # Module import alone is not enough
+        return False
+    except Exception:
+        return False
+
+
 class MSplatTrainer:
     name = "msplat"
 
     def is_available(self) -> bool:
-        return msplat_importable() or find_msplat_cli() is not None
+        return msplat_trainer_works()
 
     def train(
         self,
