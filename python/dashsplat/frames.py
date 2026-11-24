@@ -12,7 +12,6 @@ from dashsplat.accel.decode import (
     decode_cameras_parallel,
     ffmpeg_extract_frames,
     probe_duration_sec,
-    probe_frame_pts_sec,
 )
 from dashsplat.accel.device import HostInfo, detect_host
 from dashsplat.cameras import CAMERA_RIG, CameraId, CameraExtrinsics, intrinsics_matrix
@@ -34,11 +33,11 @@ def extract_frames_ffmpeg(
     max_frames: int = 8,
     prefix: str = "frame",
     host: HostInfo | None = None,
-) -> list[Path]:
-    frames, _device = ffmpeg_extract_frames(
+) -> tuple[list[Path], list[float]]:
+    frames, _device, pts = ffmpeg_extract_frames(
         mp4, out_dir, max_frames=max_frames, prefix=prefix, host=host
     )
-    return frames
+    return frames, pts
 
 
 def extract_placeholder_frames(
@@ -65,23 +64,6 @@ def extract_placeholder_frames(
     return frames
 
 
-def _frame_times_sec(mp4: Path, n_frames: int, clip_duration: float | None) -> list[float]:
-    """Best-effort timestamps for extracted frames within a clip."""
-    pts = probe_frame_pts_sec(mp4)
-    if pts and n_frames > 0:
-        if len(pts) >= n_frames:
-            # Evenly sample from available PTS
-            idxs = [int(round(i * (len(pts) - 1) / max(n_frames - 1, 1))) for i in range(n_frames)]
-            return [pts[j] for j in idxs]
-        return pts[:n_frames] + [
-            pts[-1] + (i + 1) * 0.1 for i in range(n_frames - len(pts))
-        ]
-    dur = clip_duration if clip_duration and clip_duration > 0 else float(max(n_frames - 1, 1))
-    if n_frames <= 1:
-        return [0.0] * n_frames
-    return [dur * (i / (n_frames - 1)) for i in range(n_frames)]
-
-
 def extract_event_frames(
     event: DashcamEvent,
     work_dir: Path,
@@ -95,21 +77,20 @@ def extract_event_frames(
 ) -> tuple[list[Path], list[list[list[float]]], list[list[list[float]]], list[dict], dict]:
     """Return image paths, intrinsics, c2w poses, camera dicts, and decode device report.
 
-    Iterates **all** event segments/clips per camera (not just the first 1-min clip).
+    Iterates **all** event segments/clips per camera. Frame timestamps come from
+    the actual extracted frames (ffmpeg showinfo pts). Results are **interleaved
+    by time** across cameras so MapAnything windows see multiple cameras at
+    similar times.
     """
     work_dir.mkdir(parents=True, exist_ok=True)
-    image_paths: list[Path] = []
-    Ks: list[list[list[float]]] = []
-    c2ws: list[list[list[float]]] = []
-    cameras: list[dict] = []
     offsets = load_offsets(offsets_path or (work_dir / "timing_offsets.json"))
     host = host or detect_host()
     decode_devices: dict[str, str] = {}
+    used_placeholder = False
 
     cam_ids: list[CameraId] = list(event.cameras) or ["front"]  # type: ignore[arg-type]
     use_ffmpeg = _have_ffmpeg()
 
-    # Per camera: all segment MP4s in timeline order
     cam_clips: dict[str, list[tuple[float, Path, CameraExtrinsics]]] = {}
     for cam_id in cam_ids:
         if cam_id not in CAMERA_RIG:
@@ -123,7 +104,6 @@ def extract_event_frames(
             clips.sort(key=lambda x: x[0])
             cam_clips[cam_id] = clips
 
-    # Budget frames across all clips for each camera
     jobs: list[tuple[Path, Path, str, int]] = []
     job_meta: dict[str, tuple[str, float, Path, CameraExtrinsics, int]] = {}
     for cam_id, clips in cam_clips.items():
@@ -138,7 +118,7 @@ def extract_event_frames(
             if use_ffmpeg:
                 jobs.append((mp4, out, prefix, n_here))
 
-    decoded: dict[str, tuple[list[Path], str]] = {}
+    decoded: dict[str, tuple[list[Path], str, list[float]]] = {}
     if jobs:
         if progress:
             progress("Decoding cameras/clips in parallel…", 0.1)
@@ -149,7 +129,9 @@ def extract_event_frames(
             progress=progress,
         )
 
-    idx = 0
+    # Collect unsorted rows, then interleave by time_sec
+    rows: list[tuple[float, Path, list[list[float]], list[list[float]], dict]] = []
+
     for ci, cam_id in enumerate(cam_ids):
         if cam_id not in cam_clips:
             continue
@@ -160,11 +142,12 @@ def extract_event_frames(
             prefix = f"{cam_id}_s{si:03d}"
             out = work_dir / "frames" / cam_id / f"seg_{si:03d}"
             n_here = job_meta[prefix][4]
+            pts: list[float] = []
             if prefix in decoded:
-                frames, device = decoded[prefix]
+                frames, device, pts = decoded[prefix]
                 decode_devices[cam_id] = device
             elif use_ffmpeg:
-                frames = extract_frames_ffmpeg(
+                frames, pts = extract_frames_ffmpeg(
                     mp4, out, max_frames=n_here, prefix=prefix, host=host
                 )
                 decode_devices[cam_id] = "ffmpeg"
@@ -180,13 +163,19 @@ def extract_event_frames(
                     width=cam.width // 4,
                     height=cam.height // 4,
                 )
+                used_placeholder = True
+                clip_dur = probe_duration_sec(mp4) or float(max(n_here - 1, 1))
+                pts = [
+                    clip_dur * (i / max(n_here - 1, 1)) if n_here > 1 else 0.0
+                    for i in range(len(frames))
+                ]
                 if decode_devices.get(cam_id) in ("videotoolbox", "ffmpeg"):
                     decode_devices[cam_id] = "software_fallback_or_placeholder"
                 else:
                     decode_devices[cam_id] = decode_devices.get(cam_id, "placeholder")
 
-            clip_dur = probe_duration_sec(mp4)
-            frame_times = _frame_times_sec(mp4, len(frames), clip_dur)
+            while len(pts) < len(frames):
+                pts.append(float(len(pts)))
 
             for fi, frame in enumerate(frames):
                 with Image.open(frame) as im:
@@ -198,7 +187,7 @@ def extract_event_frames(
                     [0.0, K[1][1] * scale_y, K[1][2] * scale_y],
                     [0.0, 0.0, 1.0],
                 ]
-                local_t = frame_times[fi] if fi < len(frame_times) else float(fi)
+                local_t = float(pts[fi])
                 raw_t = seg_off + local_t
                 t = apply_offset(raw_t, cam_id, offsets)
                 if poses:
@@ -215,29 +204,55 @@ def extract_event_frames(
                 cam_pose = apply_vehicle_camera_offset(vehicle, cam.position, yaw_off)
                 c2w = cam_pose.c2w_matrix(z=cam.position[2])
                 name = f"{cam_id}_{global_fi:04d}.jpg"
-                image_paths.append(frame)
-                Ks.append(K_scaled)
-                c2ws.append(c2w)
-                cameras.append(
-                    {
-                        "id": idx,
-                        "camera": cam_id,
-                        "file_path": str(frame),
-                        "file_name": name,
-                        "transform_matrix": c2w,
-                        "fl_x": K_scaled[0][0],
-                        "fl_y": K_scaled[1][1],
-                        "cx": K_scaled[0][2],
-                        "cy": K_scaled[1][2],
-                        "w": w,
-                        "h": h,
-                        "time_sec": t,
-                        "segment_offset_sec": seg_off,
-                        "clip_path": str(mp4),
-                    }
+                rows.append(
+                    (
+                        t,
+                        frame,
+                        K_scaled,
+                        c2w,
+                        {
+                            "camera": cam_id,
+                            "file_path": str(frame),
+                            "file_name": name,
+                            "transform_matrix": c2w,
+                            "fl_x": K_scaled[0][0],
+                            "fl_y": K_scaled[1][1],
+                            "cx": K_scaled[0][2],
+                            "cy": K_scaled[1][2],
+                            "w": w,
+                            "h": h,
+                            "time_sec": t,
+                            "segment_offset_sec": seg_off,
+                            "clip_path": str(mp4),
+                        },
+                    )
                 )
-                idx += 1
                 global_fi += 1
         if progress:
             progress(f"Extracted {cam_id}", 0.1 + 0.1 * (ci + 1) / max(len(cam_ids), 1))
-    return image_paths, Ks, c2ws, cameras, {"cameras": decode_devices, "host_chip": host.chip}
+
+    # Interleave by timeline so MapAnything windows mix cameras at similar times
+    rows.sort(key=lambda r: (r[0], r[4]["camera"]))
+    image_paths: list[Path] = []
+    Ks: list[list[list[float]]] = []
+    c2ws: list[list[list[float]]] = []
+    cameras: list[dict] = []
+    for i, (t, frame, K_scaled, c2w, meta) in enumerate(rows):
+        meta = {**meta, "id": i}
+        image_paths.append(frame)
+        Ks.append(K_scaled)
+        c2ws.append(c2w)
+        cameras.append(meta)
+
+    report = {
+        "cameras": decode_devices,
+        "host_chip": host.chip,
+        "placeholder_used": used_placeholder,
+        "warning": (
+            "Placeholder frames used (ffmpeg decode failed or unavailable). "
+            "Geometry quality will be poor."
+            if used_placeholder
+            else None
+        ),
+    }
+    return image_paths, Ks, c2ws, cameras, report
