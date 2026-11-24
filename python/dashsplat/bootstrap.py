@@ -161,9 +161,11 @@ def bootstrap(
     extras = "dev"
     if with_mlx and sys.platform == "darwin":
         extras = "dev,mlx"
-    code = _run([uv, "pip", "install", "--python", str(py), "-e", f"{pkg_root}[{extras}]"])
+    # Non-editable install into Application Support venv — never `-e` into the
+    # app bundle / source tree (Finder-launched apps must not mutate the bundle).
+    code = _run([uv, "pip", "install", "--python", str(py), f"{pkg_root}[{extras}]"])
     if code != 0:
-        code = _run([uv, "pip", "install", "--python", str(py), "-e", f"{pkg_root}[dev]"])
+        code = _run([uv, "pip", "install", "--python", str(py), f"{pkg_root}[dev]"])
         if code != 0:
             return {"ok": False, "exit_code": code, "step": "pip"}
 

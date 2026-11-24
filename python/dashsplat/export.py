@@ -111,6 +111,126 @@ def write_simple_point_ply(path: Path, points: np.ndarray, colors: np.ndarray) -
         np.savetxt(f, body, fmt="%.6f %.6f %.6f %d %d %d")
 
 
+def read_gaussian_ply_xyz_rgb(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Read xyz + approximate RGB from a 3DGS or XYZRGB PLY written by this package."""
+    with path.open("rb") as f:
+        header_lines: list[str] = []
+        while True:
+            line = f.readline()
+            if not line:
+                raise ValueError(f"truncated PLY header: {path}")
+            text = line.decode("ascii", errors="replace").rstrip("\n").rstrip("\r")
+            header_lines.append(text)
+            if text == "end_header":
+                break
+        header = "\n".join(header_lines)
+        n = 0
+        for hl in header_lines:
+            if hl.startswith("element vertex"):
+                n = int(hl.split()[-1])
+                break
+        props: list[tuple[str, str]] = []
+        in_vertex = False
+        for hl in header_lines:
+            if hl.startswith("element "):
+                in_vertex = hl.startswith("element vertex")
+                continue
+            if in_vertex and hl.startswith("property "):
+                parts = hl.split()
+                if len(parts) >= 3:
+                    props.append((parts[1], parts[2]))
+        is_ascii = "format ascii" in header
+        is_le = "binary_little_endian" in header
+        if is_ascii:
+            means = np.zeros((n, 3), dtype=np.float64)
+            colors = np.zeros((n, 3), dtype=np.float64)
+            for i in range(n):
+                parts = f.readline().decode("ascii").split()
+                by_name = {name: float(parts[j]) for j, (_, name) in enumerate(props) if j < len(parts)}
+                means[i] = [by_name.get("x", 0), by_name.get("y", 0), by_name.get("z", 0)]
+                if "red" in by_name:
+                    colors[i] = [by_name["red"] / 255.0, by_name["green"] / 255.0, by_name["blue"] / 255.0]
+                elif "f_dc_0" in by_name:
+                    sh = 0.28209479177387814
+                    colors[i] = [
+                        by_name["f_dc_0"] * sh + 0.5,
+                        by_name["f_dc_1"] * sh + 0.5,
+                        by_name["f_dc_2"] * sh + 0.5,
+                    ]
+            return means, np.clip(colors, 0, 1)
+        # binary
+        type_size = {
+            "char": 1, "uchar": 1, "int8": 1, "uint8": 1,
+            "short": 2, "ushort": 2, "int16": 2, "uint16": 2,
+            "int": 4, "uint": 4, "int32": 4, "uint32": 4,
+            "float": 4, "float32": 4, "double": 8, "float64": 8,
+        }
+        stride = sum(type_size.get(t, 4) for t, _ in props)
+        raw = f.read(n * stride)
+        if len(raw) < n * stride:
+            raise ValueError(f"short PLY body: {path}")
+        endian = "<" if is_le else ">"
+        dt_map = {
+            "float": f"{endian}f4", "float32": f"{endian}f4",
+            "double": f"{endian}f8", "float64": f"{endian}f8",
+            "uchar": "u1", "uint8": "u1", "char": "i1", "int8": "i1",
+            "ushort": f"{endian}u2", "uint16": f"{endian}u2",
+            "short": f"{endian}i2", "int16": f"{endian}i2",
+            "uint": f"{endian}u4", "uint32": f"{endian}u4",
+            "int": f"{endian}i4", "int32": f"{endian}i4",
+        }
+        dtype = np.dtype([(name, dt_map.get(t, f"{endian}f4")) for t, name in props])
+        arr = np.frombuffer(raw, dtype=dtype, count=n)
+        means = np.column_stack([arr["x"], arr["y"], arr["z"]]).astype(np.float64)
+        names = {name for _, name in props}
+        if "red" in names:
+            colors = np.column_stack([arr["red"], arr["green"], arr["blue"]]).astype(np.float64) / 255.0
+        elif "f_dc_0" in names:
+            sh = 0.28209479177387814
+            colors = np.column_stack([arr["f_dc_0"], arr["f_dc_1"], arr["f_dc_2"]]).astype(np.float64)
+            colors = colors * sh + 0.5
+        else:
+            colors = np.full((n, 3), 0.7, dtype=np.float64)
+        return means, np.clip(colors, 0, 1)
+
+
+def merge_gaussian_plies(
+    paths: list[Path],
+    dest: Path,
+    *,
+    voxel_m: float = 0.05,
+    max_points: int | None = None,
+) -> Path:
+    """Concatenate tile PLYs in a common world frame and voxel-dedupe overlap."""
+    if not paths:
+        raise ValueError("no PLY paths to merge")
+    all_m: list[np.ndarray] = []
+    all_c: list[np.ndarray] = []
+    for p in paths:
+        m, c = read_gaussian_ply_xyz_rgb(p)
+        if m.shape[0]:
+            all_m.append(m)
+            all_c.append(c)
+    if not all_m:
+        write_gaussian_ply(dest, np.zeros((0, 3)), np.zeros((0, 3)))
+        return dest
+    means = np.concatenate(all_m, axis=0)
+    colors = np.concatenate(all_c, axis=0)
+    if voxel_m > 0 and means.shape[0]:
+        keys = np.floor(means / voxel_m).astype(np.int64)
+        # Stable unique: keep first occurrence per voxel
+        _, idx = np.unique(keys, axis=0, return_index=True)
+        idx = np.sort(idx)
+        means = means[idx]
+        colors = colors[idx]
+    if max_points is not None and means.shape[0] > max_points:
+        step = max(1, means.shape[0] // max_points)
+        means = means[::step][:max_points]
+        colors = colors[::step][:max_points]
+    write_gaussian_ply(dest, means, colors)
+    return dest
+
+
 def write_spz_stub(path: Path, means: np.ndarray, colors: np.ndarray) -> None:
     """Minimal .spz sidecar: JSON gzip of positions+colors for Spark-compatible tooling.
 

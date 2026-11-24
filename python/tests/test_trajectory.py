@@ -130,3 +130,17 @@ def test_pillar_yaws_face_outward():
     rf = np.asarray(right.c2w_matrix(), dtype=np.float64)[:3, 2]
     assert lf[0] < 0.0  # left pillar → west
     assert rf[0] > 0.0  # right pillar → east
+
+
+def test_camera_yaw_offset_subtracts_from_compass_heading():
+    """Compass heading is clockwise; ENU yaw offset is CCW → opposite sign."""
+    vehicle = Pose(
+        time_sec=0,
+        position=(0, 0, 0),
+        yaw_rad=heading_deg_to_enu_yaw(90.0),
+        heading_deg=90.0,
+        speed_mps=0,
+    )
+    cam = apply_vehicle_camera_offset(vehicle, (0.0, 0.0, 0.0), cam_yaw_offset_deg=30.0)
+    assert abs(cam.heading_deg - 60.0) < 1e-6
+    assert abs(cam.yaw_rad - (vehicle.yaw_rad + np.radians(30.0))) < 1e-9

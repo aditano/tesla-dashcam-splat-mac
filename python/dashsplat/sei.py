@@ -168,6 +168,7 @@ def extract_sei_from_mp4(path: Path, fps: float = 36.0) -> list[SeiSample]:
 
     Prefer ffprobe packet PTS when available; else `frame_seq_no / fps`; else
     sequential index / fps. Never invent a hard-coded 60 s clip length here.
+    Times are relative to the start of **this** clip (0-based).
     """
     samples: list[SeiSample] = []
     for payload in iter_sei_payloads(path):
@@ -191,3 +192,41 @@ def extract_sei_from_mp4(path: Path, fps: float = 36.0) -> list[SeiSample]:
         else:
             s.time_sec = float(i) / float(fps)
     return samples
+
+
+def extract_sei_from_event(event, fps: float = 36.0) -> list[SeiSample]:
+    """Parse SEI from **every** event segment and stitch into one timeline.
+
+    Each clip's samples are offset by ``segment.time_offset_sec`` so poses after
+    minute 1 continue advancing instead of snapping to the first clip's last pose.
+    Prefers the front camera when present; otherwise any camera in the segment.
+    """
+    from dashsplat.events import DashcamEvent  # local import for typing without cycle
+
+    if not isinstance(event, DashcamEvent):
+        raise TypeError("event must be a DashcamEvent")
+
+    all_samples: list[SeiSample] = []
+    for seg in event.segments:
+        path = seg.cameras.get("front")
+        if path is None and seg.cameras:
+            path = next(iter(seg.cameras.values()))
+        if path is None:
+            continue
+        clip_samples = extract_sei_from_mp4(path, fps=fps)
+        off = float(seg.time_offset_sec)
+        for s in clip_samples:
+            # Copy so we don't mutate if callers share lists
+            stamped = SeiSample(
+                version=s.version,
+                gear_state=s.gear_state,
+                frame_seq_no=s.frame_seq_no,
+                vehicle_speed_mps=s.vehicle_speed_mps,
+                latitude_deg=s.latitude_deg,
+                longitude_deg=s.longitude_deg,
+                heading_deg=s.heading_deg,
+                time_sec=off + float(s.time_sec),
+            )
+            all_samples.append(stamped)
+    all_samples.sort(key=lambda s: s.time_sec)
+    return all_samples

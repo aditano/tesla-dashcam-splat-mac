@@ -114,15 +114,19 @@ final class PythonBridge {
         let proc = activeProcess
         processLock.unlock()
         guard let proc, proc.isRunning else { return }
-        proc.terminate() // SIGTERM
+        let pid = proc.processIdentifier
+        // Python is started as its own process group (os.setpgrp); kill the
+        // whole group so brush/ffmpeg children die with it.
+        kill(-pid, SIGTERM)
+        proc.terminate() // also signal the leader
         DispatchQueue.global().async {
             let deadline = Date().addingTimeInterval(5.0)
             while proc.isRunning, Date() < deadline {
                 Thread.sleep(forTimeInterval: 0.1)
             }
             if proc.isRunning {
-                // SIGKILL after timeout
-                kill(proc.processIdentifier, SIGKILL)
+                kill(-pid, SIGKILL)
+                kill(pid, SIGKILL)
             }
         }
     }
@@ -297,10 +301,18 @@ final class PythonBridge {
     }
 
     private func defaultEnv() -> [String: String] {
-        [
+        let venvBin = supportDir.appendingPathComponent("venv/bin").path
+        let pathExtras = ["/opt/homebrew/bin", "/usr/local/bin", venvBin]
+        let existing = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin"
+        var parts = pathExtras + existing.split(separator: ":").map(String.init)
+        var seen = Set<String>()
+        parts = parts.filter { seen.insert($0).inserted }
+        return [
             "PYTHONPATH": repoPython.path,
             "DASHSPLAT_SUPPORT_DIR": supportDir.path,
             "PYTHONUNBUFFERED": "1",
+            "DASHSPLAT_OWN_PGROUP": "1",
+            "PATH": parts.joined(separator: ":"),
         ]
     }
 
@@ -327,6 +339,17 @@ final class PythonBridge {
             for (k, v) in env { fullEnv[k] = v }
             // Force line-buffered Python stdio when possible
             fullEnv["PYTHONUNBUFFERED"] = "1"
+            if fullEnv["DASHSPLAT_OWN_PGROUP"] == nil {
+                fullEnv["DASHSPLAT_OWN_PGROUP"] = "1"
+            }
+            // Finder-launched apps often lack Homebrew on PATH — ensure ffmpeg/uv resolve.
+            let venvBin = self.supportDir.appendingPathComponent("venv/bin").path
+            let pathExtras = ["/opt/homebrew/bin", "/usr/local/bin", venvBin]
+            let existingPath = fullEnv["PATH"] ?? "/usr/bin:/bin"
+            var pathParts = pathExtras + existingPath.split(separator: ":").map(String.init)
+            var seenPath = Set<String>()
+            pathParts = pathParts.filter { seenPath.insert($0).inserted }
+            fullEnv["PATH"] = pathParts.joined(separator: ":")
             process.environment = fullEnv
 
             let outPipe = Pipe()
@@ -337,20 +360,23 @@ final class PythonBridge {
             let ioLock = NSLock()
             var stdoutBox = ""
             var stderrBox = ""
-            var stdoutPartial = ""
-            var stderrPartial = ""
+            // Buffer raw bytes and split on newline *before* UTF-8 decode so a
+            // multibyte character split across read chunks is not dropped.
+            var stdoutBytes = Data()
+            var stderrBytes = Data()
 
-            func appendLines(
-                chunk: String,
-                partial: inout String,
+            func drainByteBuffer(
+                _ buffer: inout Data,
                 accumulate: inout String,
-                isStderr: Bool
+                isStderr: Bool,
+                flushAll: Bool
             ) {
-                partial += chunk
-                while let range = partial.rangeOfCharacter(from: .newlines) {
-                    let line = String(partial[..<range.lowerBound])
-                    partial = String(partial[range.upperBound...])
-                    // Skip bare CR leftovers
+                while true {
+                    guard let nl = buffer.firstIndex(of: 0x0A) else { break }
+                    let lineData = buffer.subdata(in: 0..<nl)
+                    buffer.removeSubrange(0...nl)
+                    let line = String(data: lineData, encoding: .utf8)
+                        ?? String(decoding: lineData, as: UTF8.self)
                     let trimmed = line.trimmingCharacters(in: CharacterSet(charactersIn: "\r"))
                     accumulate += trimmed + "\n"
                     if !trimmed.isEmpty {
@@ -359,9 +385,18 @@ final class PythonBridge {
                             onProgress(parsed.message, parsed.fraction, parsed.stage, parsed.etaSec)
                         }
                         if isStderr {
-                            // Also surface stderr into progress stream for UI visibility
                             onProgress("[stderr] \(trimmed)", -1, "log", nil)
                         }
+                    }
+                }
+                if flushAll, !buffer.isEmpty {
+                    let line = String(data: buffer, encoding: .utf8)
+                        ?? String(decoding: buffer, as: UTF8.self)
+                    let trimmed = line.trimmingCharacters(in: CharacterSet(charactersIn: "\r"))
+                    buffer.removeAll(keepingCapacity: false)
+                    if !trimmed.isEmpty {
+                        accumulate += trimmed + "\n"
+                        onLog(trimmed, isStderr)
                     }
                 }
             }
@@ -369,17 +404,17 @@ final class PythonBridge {
             outPipe.fileHandleForReading.readabilityHandler = { handle in
                 let data = handle.availableData
                 guard !data.isEmpty else { return }
-                let chunk = String(data: data, encoding: .utf8) ?? ""
                 ioLock.lock()
-                appendLines(chunk: chunk, partial: &stdoutPartial, accumulate: &stdoutBox, isStderr: false)
+                stdoutBytes.append(data)
+                drainByteBuffer(&stdoutBytes, accumulate: &stdoutBox, isStderr: false, flushAll: false)
                 ioLock.unlock()
             }
             errPipe.fileHandleForReading.readabilityHandler = { handle in
                 let data = handle.availableData
                 guard !data.isEmpty else { return }
-                let chunk = String(data: data, encoding: .utf8) ?? ""
                 ioLock.lock()
-                appendLines(chunk: chunk, partial: &stderrPartial, accumulate: &stderrBox, isStderr: true)
+                stderrBytes.append(data)
+                drainByteBuffer(&stderrBytes, accumulate: &stderrBox, isStderr: true, flushAll: false)
                 ioLock.unlock()
             }
 
@@ -390,18 +425,14 @@ final class PythonBridge {
             process.terminationHandler = { [weak self] proc in
                 outPipe.fileHandleForReading.readabilityHandler = nil
                 errPipe.fileHandleForReading.readabilityHandler = nil
-                // Flush trailing partial lines
+                // Drain any remaining pipe bytes after the process exits
+                let restOut = outPipe.fileHandleForReading.readDataToEndOfFile()
+                let restErr = errPipe.fileHandleForReading.readDataToEndOfFile()
                 ioLock.lock()
-                if !stdoutPartial.isEmpty {
-                    stdoutBox += stdoutPartial + "\n"
-                    onLog(stdoutPartial, false)
-                    stdoutPartial = ""
-                }
-                if !stderrPartial.isEmpty {
-                    stderrBox += stderrPartial + "\n"
-                    onLog(stderrPartial, true)
-                    stderrPartial = ""
-                }
+                if !restOut.isEmpty { stdoutBytes.append(restOut) }
+                if !restErr.isEmpty { stderrBytes.append(restErr) }
+                drainByteBuffer(&stdoutBytes, accumulate: &stdoutBox, isStderr: false, flushAll: true)
+                drainByteBuffer(&stderrBytes, accumulate: &stderrBox, isStderr: true, flushAll: true)
                 let out = stdoutBox
                 let err = stderrBox
                 ioLock.unlock()

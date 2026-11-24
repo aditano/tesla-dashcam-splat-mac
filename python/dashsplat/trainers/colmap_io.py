@@ -1,7 +1,8 @@
 """COLMAP text model writer shared by Brush / msplat / seeded trainers.
 
 Cameras: one COLMAP CAMERA_ID per physical dashcam (shared intrinsics across
-frames), not one PINHOLE per frame. Model is OPENCV (fx fy cx cy k1 k2 p1 p2).
+frames), not one PINHOLE per frame. Model is PINHOLE when distortion is all zero; OPENCV (fx fy cx cy k1 k2 p1 p2)
+when coeffs are supplied. Distortion defaults stay 0 — never invented.
 
 Intrinsics are taken from the existing camera dict (`fl_x`/`fl_y`/`cx`/`cy`/
 `w`/`h`) — we do **not** invent focal lengths here. Distortion coefficients
@@ -89,13 +90,19 @@ def write_colmap_sparse(
         cx = float(cam["cx"]) if "cx" in cam else w / 2.0
         cy = float(cam["cy"]) if "cy" in cam else h / 2.0
         # Distortion: use caller-supplied coeffs when present; otherwise zeros.
-        # Calibrated Tesla lens params are not in-repo; OPENCV model reserved for
-        # future calibration without inventing k/p values.
+        # We do NOT invent Tesla lens distortion — calibrated k/p are not in-repo.
+        # When all distortion coeffs are zero and the caller did not force a model,
+        # emit PINHOLE (fx fy cx cy) so COLMAP consumers don't assume unused k/p.
         k1 = float(cam.get("k1", 0.0))
         k2 = float(cam.get("k2", 0.0))
         p1 = float(cam.get("p1", 0.0))
         p2 = float(cam.get("p2", 0.0))
-        model = str(cam.get("colmap_model") or "OPENCV")
+        if "colmap_model" in cam:
+            model = str(cam["colmap_model"])
+        elif abs(k1) + abs(k2) + abs(p1) + abs(p2) == 0.0:
+            model = "PINHOLE"
+        else:
+            model = "OPENCV"
         phys_intrinsics[key] = {
             "model": model,
             "w": w,
@@ -113,7 +120,8 @@ def write_colmap_sparse(
     cam_lines = [
         "# Camera list with one line of data per camera:",
         "# CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]",
-        "# OPENCV params: fx fy cx cy k1 k2 p1 p2 (k/p default 0; not invented)",
+        "# Distortion defaults to 0 (not invented). PINHOLE when k/p all zero;",
+        "# OPENCV (fx fy cx cy k1 k2 p1 p2) only when coeffs or colmap_model set.",
         "# One CAMERA_ID per physical dashcam; frames share intrinsics.",
     ]
     cam_id_by_key: dict[str, int] = {}
@@ -126,6 +134,11 @@ def write_colmap_sparse(
                 f"{cam_id} OPENCV_FISHEYE {p['w']} {p['h']} "
                 f"{p['fx']} {p['fy']} {p['cx']} {p['cy']} "
                 f"{p['k1']} {p['k2']} {float(0.0)} {float(0.0)}"
+            )
+        elif p["model"] == "PINHOLE":
+            cam_lines.append(
+                f"{cam_id} PINHOLE {p['w']} {p['h']} "
+                f"{p['fx']} {p['fy']} {p['cx']} {p['cy']}"
             )
         else:
             cam_lines.append(

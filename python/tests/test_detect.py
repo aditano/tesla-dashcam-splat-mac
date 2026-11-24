@@ -12,13 +12,21 @@ def test_looks_encrypted_detects_encv(tmp_path: Path):
     assert looks_encrypted_mp4(p) is True
 
 
-def test_looks_encrypted_reads_only_header(tmp_path: Path):
-    """Must not need the whole file — encv past the header window is ignored."""
+def test_looks_encrypted_reads_head_and_tail_only(tmp_path: Path):
+    """Scans head + tail windows — never the whole file; middle markers ignored."""
     p = tmp_path / "huge.mp4"
-    # Header clean; marker only after 8 KiB
-    p.write_bytes(b"ftypisom" + b"\x00" * 8192 + b"encv" + b"\x00" * 100)
+    # 64 KiB file: encv only in the middle (outside first/last 4 KiB)
+    size = 64 * 1024
+    data = bytearray(b"ftypisom" + b"\x00" * (size - 8))
+    mid = size // 2
+    data[mid : mid + 4] = b"encv"
+    p.write_bytes(data)
     assert looks_encrypted_mp4(p, header_bytes=4096) is False
-    assert looks_encrypted_mp4(p, header_bytes=16_000) is True
+    # Marker in the tail window is detected
+    data2 = bytearray(b"ftypisom" + b"\x00" * (size - 8))
+    data2[-100:-96] = b"encv"
+    p.write_bytes(data2)
+    assert looks_encrypted_mp4(p, header_bytes=4096) is True
 
 
 def test_sample_fixture_has_sei():

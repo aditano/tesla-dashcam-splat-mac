@@ -17,6 +17,7 @@ def fit_affine_rgb(
     source: np.ndarray,
     target: np.ndarray,
     mask: np.ndarray | None = None,
+    target_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Fit per-channel scale+bias from **global** stats (not spatially paired pixels).
 
@@ -30,23 +31,24 @@ def fit_affine_rgb(
         mask[h // 2 :, :] = True
         mid = (source.mean(axis=2) > 20) & (source.mean(axis=2) < 240)
         mask &= mid
-    # Target mask: same geometric heuristic on its own image (not source coords)
-    th = target.shape[0]
-    tmask = np.zeros(target.shape[:2], dtype=bool)
-    tmask[th // 2 :, :] = True
-    tmid = (target.mean(axis=2) > 20) & (target.mean(axis=2) < 240)
-    tmask &= tmid
+    if target_mask is None:
+        th = target.shape[0]
+        target_mask = np.zeros(target.shape[:2], dtype=bool)
+        target_mask[th // 2 :, :] = True
+        tmid = (target.mean(axis=2) > 20) & (target.mean(axis=2) < 240)
+        target_mask &= tmid
 
     scales = np.ones(3, dtype=np.float64)
     biases = np.zeros(3, dtype=np.float64)
     for c in range(3):
         xs = source[..., c][mask].astype(np.float64)
-        ys = target[..., c][tmask].astype(np.float64)
+        ys = target[..., c][target_mask].astype(np.float64)
         if xs.size < 64 or ys.size < 64:
             continue
         xs_mean, xs_std = float(xs.mean()), float(xs.std()) + 1e-6
         ys_mean, ys_std = float(ys.mean()), float(ys.std()) + 1e-6
-        scales[c] = ys_std / xs_std
+        # Clamp scale so a dark/bright outlier frame cannot explode the match
+        scales[c] = float(np.clip(ys_std / xs_std, 0.25, 4.0))
         biases[c] = ys_mean - scales[c] * xs_mean
     return scales, biases
 
@@ -75,68 +77,116 @@ def apply_affine(image: np.ndarray, scale: np.ndarray, bias: np.ndarray) -> np.n
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
+def _as_path_list(value: Path | list[Path] | str | list[str]) -> list[Path]:
+    if isinstance(value, (list, tuple)):
+        return [Path(p) for p in value]
+    return [Path(value)]
+
+
+def _channel_stats(
+    paths: list[Path],
+    mask_path: Path | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Mean/std per channel aggregated across all frames (optionally masked)."""
+    sums = np.zeros(3, dtype=np.float64)
+    sq = np.zeros(3, dtype=np.float64)
+    count = 0
+    for p in paths:
+        img = np.asarray(Image.open(p).convert("RGB"), dtype=np.float64)
+        if mask_path is not None and mask_path.exists():
+            m = np.asarray(Image.open(mask_path).convert("L")) > 127
+            if m.shape == img.shape[:2]:
+                pix = img[m]
+            else:
+                pix = img.reshape(-1, 3)
+        else:
+            # Lower-half + mid-luminance heuristic
+            h = img.shape[0]
+            m = np.zeros(img.shape[:2], dtype=bool)
+            m[h // 2 :, :] = True
+            mid = (img.mean(axis=2) > 20) & (img.mean(axis=2) < 240)
+            m &= mid
+            pix = img[m] if np.any(m) else img.reshape(-1, 3)
+        if pix.size == 0:
+            continue
+        sums += pix.sum(axis=0)
+        sq += (pix * pix).sum(axis=0)
+        count += pix.shape[0]
+    if count < 64:
+        return np.array([128.0, 128.0, 128.0]), np.ones(3)
+    mean = sums / count
+    var = np.maximum(sq / count - mean * mean, 1e-6)
+    return mean, np.sqrt(var)
+
+
 def match_cameras_to_front(
-    frame_paths: dict[str, Path],
+    frame_paths: dict[str, Path | list[Path]],
     out_dir: Path,
     *,
     masks: dict[str, Path] | None = None,
     method: str = "stats",
 ) -> dict[str, dict[str, list[float]]]:
-    """Match each camera to front using global stats / histograms.
+    """Match each camera to front using global stats across all listed frames.
 
-    Writes color-matched **copies** under ``out_dir`` (never overwrites originals).
-    Optional per-camera mask paths restrict which pixels contribute to stats
-    (run after ego/sky/mover masks when available).
+    ``frame_paths`` values may be a single path or a list — stats aggregate over
+    every frame (not just the first). Front mask is applied to front stats when
+    provided (no longer a no-op). Scale is clamped to ``[0.25, 4]``.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    if "front" not in frame_paths:
+    normalized: dict[str, list[Path]] = {k: _as_path_list(v) for k, v in frame_paths.items()}
+    if "front" not in normalized:
         result = {}
-        for cam, p in frame_paths.items():
+        for cam, paths in normalized.items():
+            p = paths[0]
             dest = out_dir / p.name
             Image.open(p).save(dest)
             result[cam] = {"scale": [1, 1, 1], "bias": [0, 0, 0], "path": str(dest)}
         return result
 
-    front = np.asarray(Image.open(frame_paths["front"]).convert("RGB"))
-    front_mask = None
-    if masks and "front" in masks and Path(masks["front"]).exists():
-        front_mask = np.asarray(Image.open(masks["front"]).convert("L")) > 127
+    front_paths = normalized["front"]
+    front_mask_path = Path(masks["front"]) if masks and "front" in masks else None
+    front_mean, front_std = _channel_stats(front_paths, front_mask_path)
+    front_img = np.asarray(Image.open(front_paths[0]).convert("RGB"))
 
     affines: dict[str, dict[str, list[float]]] = {}
-    for cam, p in frame_paths.items():
-        img = np.asarray(Image.open(p).convert("RGB"))
-        cam_mask = None
-        if masks and cam in masks and Path(masks[cam]).exists():
-            cam_mask = np.asarray(Image.open(masks[cam]).convert("L")) > 127
+    for cam, paths in normalized.items():
+        img = np.asarray(Image.open(paths[0]).convert("RGB"))
+        cam_mask_path = Path(masks[cam]) if masks and cam in masks else None
         if cam == "front":
             scale, bias = np.ones(3), np.zeros(3)
             matched = img
         elif method == "histogram":
-            # Resize front only to gather a comparable histogram length, not spatial align
-            front_r = front
-            if img.shape != front.shape:
-                front_r = np.asarray(Image.fromarray(front).resize((img.shape[1], img.shape[0])))
+            front_r = front_img
+            if img.shape != front_img.shape:
+                front_r = np.asarray(
+                    Image.fromarray(front_img).resize((img.shape[1], img.shape[0]))
+                )
             matched = np.stack(
                 [match_histogram_channel(img[..., c], front_r[..., c]) for c in range(3)],
                 axis=-1,
             )
-            scale, bias = fit_affine_rgb(img, front_r, mask=cam_mask)
+            cam_mask = None
+            front_mask = None
+            if cam_mask_path and cam_mask_path.exists():
+                cam_mask = np.asarray(Image.open(cam_mask_path).convert("L")) > 127
+            if front_mask_path and front_mask_path.exists():
+                front_mask = np.asarray(Image.open(front_mask_path).convert("L")) > 127
+                if front_mask.shape != front_r.shape[:2]:
+                    front_mask = None
+            scale, bias = fit_affine_rgb(
+                img, front_r, mask=cam_mask, target_mask=front_mask
+            )
         else:
-            front_r = front
-            if img.shape != front.shape:
-                # Size match for stats sampling only — not pixel correspondence
-                front_r = np.asarray(Image.fromarray(front).resize((img.shape[1], img.shape[0])))
-            # Prefer intersection of masks when both exist; else per-image heuristic
-            mask = cam_mask
-            if mask is not None and front_mask is not None and mask.shape == front_mask.shape:
-                pass  # use cam_mask for source; fit_affine uses its own target mask
-            scale, bias = fit_affine_rgb(img, front_r, mask=mask)
+            src_mean, src_std = _channel_stats(paths, cam_mask_path)
+            scale = np.clip(front_std / np.maximum(src_std, 1e-6), 0.25, 4.0)
+            bias = front_mean - scale * src_mean
             matched = apply_affine(img, scale, bias)
-        dest = out_dir / p.name
+        dest = out_dir / paths[0].name
         Image.fromarray(matched).save(dest, quality=92)
         affines[cam] = {
             "scale": [float(x) for x in scale],
             "bias": [float(x) for x in bias],
             "path": str(dest),
+            "n_frames": len(paths),
         }
     return affines

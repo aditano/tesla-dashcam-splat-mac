@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -75,6 +76,20 @@ def probe_frame_pts_sec(mp4: Path, max_frames: int | None = None) -> list[float]
     return pts
 
 
+def _parse_showinfo_pts(stderr: str) -> list[float]:
+    """Extract pts_time values from ffmpeg showinfo filter stderr."""
+    times: list[float] = []
+    for m in re.finditer(r"pts_time:([0-9.]+)", stderr):
+        try:
+            times.append(float(m.group(1)))
+        except ValueError:
+            continue
+    if times:
+        t0 = times[0]
+        times = [t - t0 for t in times]
+    return times
+
+
 def ffmpeg_extract_frames(
     mp4: Path,
     out_dir: Path,
@@ -84,57 +99,58 @@ def ffmpeg_extract_frames(
     host: HostInfo | None = None,
     select_timestamps_sec: list[float] | None = None,
     duration_sec: float | None = None,
-) -> tuple[list[Path], str]:
+) -> tuple[list[Path], str, list[float]]:
     """Extract up to max_frames with VideoToolbox when available.
 
-    Returns (paths, device_label). Frame spacing uses the real clip duration from
-    ffprobe when available (not a hard-coded 60 s assumption).
+    Returns (paths, device_label, frame_pts_sec). Timestamps come from the
+    showinfo filter on the frames actually written — not an assumed evenly-
+    spaced grid that may disagree with ``fps=N/dur``.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     backend = preferred_decode_backend(host) if host else (
         "videotoolbox" if shutil.which("ffmpeg") else "software"
     )
     if not shutil.which("ffmpeg"):
-        return [], "none"
+        return [], "none", []
+
+    # Clear prior frames for this prefix
+    for old in out_dir.glob(f"{prefix}_*.jpg"):
+        old.unlink(missing_ok=True)
 
     pattern = out_dir / f"{prefix}_%04d.jpg"
-    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
-    device = "software"
-    if backend == "videotoolbox":
-        cmd += ["-hwaccel", "videotoolbox"]
-        device = "videotoolbox"
-
     dur = duration_sec if duration_sec and duration_sec > 0 else probe_duration_sec(mp4)
     if dur is None or dur <= 0:
-        dur = 60.0  # last-resort only when probe fails
-    # Spread max_frames across the real clip duration
-    vf = f"fps={max(1, max_frames)}/{max(dur, 0.1)}"
+        dur = 60.0
+
+    n = max(1, max_frames)
     if select_timestamps_sec:
-        vf = f"fps={max(1, min(max_frames, len(select_timestamps_sec)))}/{max(dur, 0.1)}"
-    cmd += ["-i", str(mp4), "-vf", vf, "-frames:v", str(max_frames), "-q:v", "3", str(pattern)]
-    subprocess.run(cmd, capture_output=True, check=False)
-    frames = sorted(out_dir.glob(f"{prefix}_*.jpg"))[:max_frames]
+        n = max(1, min(max_frames, len(select_timestamps_sec)))
+    # fps=N/dur yields ~N frames across the clip; showinfo records actual pts
+    vf = f"fps={n}/{max(dur, 0.1)},showinfo"
+
+    def _run(hw: bool) -> tuple[list[Path], str, list[float]]:
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "info"]
+        device = "software"
+        if hw and backend == "videotoolbox":
+            cmd += ["-hwaccel", "videotoolbox"]
+            device = "videotoolbox"
+        cmd += ["-i", str(mp4), "-vf", vf, "-frames:v", str(n), "-q:v", "3", str(pattern)]
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        frames = sorted(out_dir.glob(f"{prefix}_*.jpg"))[:n]
+        pts = _parse_showinfo_pts(proc.stderr or "")
+        if len(pts) > len(frames):
+            pts = pts[: len(frames)]
+        while len(pts) < len(frames):
+            # Fallback aligned with fps=N/dur spacing
+            i = len(pts)
+            pts.append(i * dur / max(n, 1))
+        return frames, device, pts
+
+    frames, device, pts = _run(hw=True)
     if not frames and device == "videotoolbox":
-        cmd2 = [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            str(mp4),
-            "-vf",
-            vf,
-            "-frames:v",
-            str(max_frames),
-            "-q:v",
-            "3",
-            str(pattern),
-        ]
-        subprocess.run(cmd2, capture_output=True, check=False)
-        frames = sorted(out_dir.glob(f"{prefix}_*.jpg"))[:max_frames]
+        frames, device, pts = _run(hw=False)
         device = "software_fallback"
-    return frames, device
+    return frames, device, pts
 
 
 def decode_cameras_parallel(
@@ -143,17 +159,20 @@ def decode_cameras_parallel(
     host: HostInfo | None = None,
     max_workers: int = 4,
     progress: ProgressCb | None = None,
-) -> dict[str, tuple[list[Path], str]]:
-    """Decode multiple cameras in parallel. jobs: (mp4, out_dir, prefix, max_frames)."""
-    results: dict[str, tuple[list[Path], str]] = {}
+) -> dict[str, tuple[list[Path], str, list[float]]]:
+    """Decode multiple cameras in parallel. jobs: (mp4, out_dir, prefix, max_frames).
+
+    Returns prefix → (paths, device, frame_pts_sec).
+    """
+    results: dict[str, tuple[list[Path], str, list[float]]] = {}
     workers = max(1, min(max_workers, len(jobs) or 1))
 
-    def _one(job: tuple[Path, Path, str, int]) -> tuple[str, list[Path], str]:
+    def _one(job: tuple[Path, Path, str, int]) -> tuple[str, list[Path], str, list[float]]:
         mp4, out_dir, prefix, max_frames = job
-        paths, device = ffmpeg_extract_frames(
+        paths, device, pts = ffmpeg_extract_frames(
             mp4, out_dir, max_frames=max_frames, prefix=prefix, host=host
         )
-        return prefix, paths, device
+        return prefix, paths, device, pts
 
     if not jobs:
         return results
@@ -161,8 +180,8 @@ def decode_cameras_parallel(
         futs = {ex.submit(_one, j): j[2] for j in jobs}
         done = 0
         for fut in as_completed(futs):
-            prefix, paths, device = fut.result()
-            results[prefix] = (paths, device)
+            prefix, paths, device, pts = fut.result()
+            results[prefix] = (paths, device, pts)
             done += 1
             if progress:
                 progress(f"Decoded {prefix} ({device})", done / len(jobs))

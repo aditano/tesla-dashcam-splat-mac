@@ -27,8 +27,9 @@ def test_one_camera_per_physical_shared_intrinsics(tmp_path):
     cam_txt = (out / "sparse" / "0" / "cameras.txt").read_text()
     data_lines = [ln for ln in cam_txt.splitlines() if ln and not ln.startswith("#")]
     assert len(data_lines) == 2  # front + back only
-    assert "OPENCV" in data_lines[0]
-    assert "PINHOLE" not in cam_txt
+    # Distortion all zero → PINHOLE (do not invent k/p or pretend OPENCV)
+    assert "PINHOLE" in data_lines[0]
+    assert "OPENCV" not in data_lines[0]
     # Existing focals preserved, not reinvented
     assert "500.0" in data_lines[0] or "500" in data_lines[0]
     img_txt = (out / "sparse" / "0" / "images.txt").read_text()

@@ -175,10 +175,10 @@ def heading_to_c2w(east: float, north: float, heading_deg: float, z: float = 1.2
     """Camera-to-world for a forward-facing camera at vehicle pose (nerfstudio OpenCV-ish)."""
     yaw = math.radians(90.0 - heading_deg)  # ENU yaw
     c, s = math.cos(yaw), math.sin(yaw)
-    # Columns: right, down, forward
-    right = [-s, c, 0.0]
+    # Columns: right, down, forward — right = down × forward (same as trajectory.py)
     down = [0.0, 0.0, -1.0]
     forward = [c, s, 0.0]
+    right = [s, -c, 0.0]
     return [
         [right[0], down[0], forward[0], east],
         [right[1], down[1], forward[1], north],
