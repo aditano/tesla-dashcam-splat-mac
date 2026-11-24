@@ -62,19 +62,21 @@ HW3_CAMERA_RIG: dict[CameraId, CameraExtrinsics] = {
         fisheye=0.35,
         notes="Approx. hatch/rear camera; wide FOV estimate.",
     ),
+    # Yaw offsets: body +Y is left. Positive yaw rotates toward +Y (left).
+    # Left repeater must face left/rearward (+yaw); right faces right/rearward (−yaw).
     "left_repeater": CameraExtrinsics(
         position=(1.55, 0.95, 0.85),
-        rotation_deg=(0, -155, 0),
-        hfov_deg=80,
-        fisheye=0.45,
-        notes="Approx. left fender repeater, rear-biased.",
-    ),
-    "right_repeater": CameraExtrinsics(
-        position=(1.55, -0.95, 0.85),
         rotation_deg=(0, 155, 0),
         hfov_deg=80,
         fisheye=0.45,
-        notes="Approx. right fender repeater, rear-biased.",
+        notes="Approx. left fender repeater, rear-biased (outward/left).",
+    ),
+    "right_repeater": CameraExtrinsics(
+        position=(1.55, -0.95, 0.85),
+        rotation_deg=(0, -155, 0),
+        hfov_deg=80,
+        fisheye=0.45,
+        notes="Approx. right fender repeater, rear-biased (outward/right).",
     ),
 }
 
@@ -82,17 +84,17 @@ HW3_CAMERA_RIG: dict[CameraId, CameraExtrinsics] = {
 HW4_PILLAR_RIG: dict[CameraId, CameraExtrinsics] = {
     "left_pillar": CameraExtrinsics(
         position=(0.55, 0.55, 1.15),
-        rotation_deg=(0, -90, 0),
-        hfov_deg=90,
-        fisheye=0.25,
-        notes="Approx. left B-pillar (HW4). Prefer self-calibration when available.",
-    ),
-    "right_pillar": CameraExtrinsics(
-        position=(0.55, -0.55, 1.15),
         rotation_deg=(0, 90, 0),
         hfov_deg=90,
         fisheye=0.25,
-        notes="Approx. right B-pillar (HW4). Prefer self-calibration when available.",
+        notes="Approx. left B-pillar (HW4), facing left (+Y). Prefer self-calibration.",
+    ),
+    "right_pillar": CameraExtrinsics(
+        position=(0.55, -0.55, 1.15),
+        rotation_deg=(0, -90, 0),
+        hfov_deg=90,
+        fisheye=0.25,
+        notes="Approx. right B-pillar (HW4), facing right (−Y). Prefer self-calibration.",
     ),
 }
 
