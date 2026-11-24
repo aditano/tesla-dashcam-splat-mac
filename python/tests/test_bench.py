@@ -28,7 +28,15 @@ def test_bench_cli_synthetic(tmp_path: Path):
     mod.main(["--out", str(event_dir), "--timestamp", "2025-11-20_14-03-12"])
     (event_dir / "event.json").write_text(json.dumps({"city": "Test"}))
     out = tmp_path / "bench"
-    report = run_bench(tmp_path, "2025-11-20_14-03-12", out, use_mlx=False, trainer="seeded")
+    # Event ids are source-prefixed (SavedClips/…) so match by suffix / scan first event
+    events_id = None
+    from dashsplat.events import scan_teslacam
+
+    scanned = scan_teslacam(tmp_path)
+    assert scanned
+    events_id = scanned[0].id
+    assert "2025-11-20_14-03-12" in events_id
+    report = run_bench(tmp_path, events_id, out, use_mlx=False, trainer="seeded")
     assert report["exit_code"] == 0
     assert report["ok"] is True
     assert "timings_sec" in report

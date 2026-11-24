@@ -18,12 +18,14 @@ class ClipHealth:
     sample_count: int = 0
 
 
-def looks_encrypted_mp4(path: Path) -> bool:
-    """Heuristic: Tesla encrypted clips often lack a readable avc1 mdat with SEI
-    and may be tiny / have 'encv' / 'senc' atoms. We flag 'encv'/'senc' if present
-    or completely empty media."""
+def looks_encrypted_mp4(path: Path, *, header_bytes: int = 256 * 1024) -> bool:
+    """Heuristic: Tesla encrypted clips often have 'encv' / 'senc' / 'enca' atoms.
+
+    Reads only the first ``header_bytes`` (default 256 KiB) — never the whole file.
+    """
     try:
-        data = path.read_bytes()
+        with path.open("rb") as f:
+            data = f.read(header_bytes)
     except OSError:
         return True
     if len(data) < 64:

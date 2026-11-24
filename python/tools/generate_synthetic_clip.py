@@ -75,20 +75,124 @@ def fullbox(typ: bytes, version: int, flags: int, payload: bytes) -> bytes:
     return box(typ, struct.pack(">I", (version << 24) | flags) + payload)
 
 
+def _annexb_to_avcc_nals(data: bytes) -> list[bytes]:
+    """Split Annex-B byte-stream into NAL units (without start codes)."""
+    # Find all start-code positions and NAL payload starts
+    starts: list[tuple[int, int]] = []  # (nal_start, start_code_len)
+    i = 0
+    while i + 3 <= len(data):
+        if i + 4 <= len(data) and data[i : i + 4] == b"\x00\x00\x00\x01":
+            starts.append((i + 4, 4))
+            i += 4
+        elif data[i : i + 3] == b"\x00\x00\x01":
+            starts.append((i + 3, 3))
+            i += 3
+        else:
+            i += 1
+    nals: list[bytes] = []
+    for si, (nal_start, _) in enumerate(starts):
+        if si + 1 < len(starts):
+            next_sc = starts[si + 1][0] - starts[si + 1][1]
+            end = next_sc
+        else:
+            end = len(data)
+        nal = data[nal_start:end]
+        if nal:
+            nals.append(nal)
+    return nals
+
+
+def generate_testsrc_bitstream(
+    n_frames: int,
+    *,
+    width: int = 320,
+    height: int = 240,
+    fps: int = 12,
+) -> tuple[list[bytes], bytes, bytes] | None:
+    """Return (vcl_nals, sps, pps) from ffmpeg lavfi testsrc (real decodable video)."""
+    import shutil
+    import subprocess
+    import tempfile
+
+    if not shutil.which("ffmpeg"):
+        return None
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "testsrc.h264"
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            f"testsrc=size={width}x{height}:rate={fps}",
+            "-frames:v",
+            str(n_frames),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            "1",  # all IDR for simple mux
+            "-bf",
+            "0",
+            "-f",
+            "h264",
+            str(out),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, check=False)
+        if proc.returncode != 0 or not out.exists():
+            return None
+        raw = out.read_bytes()
+    nals = _annexb_to_avcc_nals(raw)
+    sps_list = [n for n in nals if n and (n[0] & 0x1F) == 7]
+    pps_list = [n for n in nals if n and (n[0] & 0x1F) == 8]
+    vcl = [n for n in nals if n and (n[0] & 0x1F) in (1, 5)]
+    if len(vcl) < n_frames or not sps_list or not pps_list:
+        return None
+    return vcl[:n_frames], sps_list[0], pps_list[0]
+
+
+def generate_testsrc_idr_nals(
+    n_frames: int,
+    *,
+    width: int = 320,
+    height: int = 240,
+    fps: int = 12,
+) -> list[bytes] | None:
+    packed = generate_testsrc_bitstream(n_frames, width=width, height=height, fps=fps)
+    return packed[0] if packed else None
+
+
 def build_minimal_mp4_with_sei(
     sei_nals: list[bytes],
     width: int = 320,
     height: int = 240,
     timescale: int = 90000,
     fps: int = 12,
+    video_nals: list[bytes] | None = None,
+    sps: bytes | None = None,
+    pps: bytes | None = None,
 ) -> bytes:
-    """Build a tiny avc1 MP4: ftyp + moov + mdat with SEI NALs."""
-    dummy_idr = bytes([0x65, 0x88, 0x84, 0x00, 0x10])
+    """Build a tiny avc1 MP4: ftyp + moov + mdat with SEI + real (or fallback) VCL NALs."""
+    # Prefer real ffmpeg testsrc NALs; fall back only if unavailable
+    if video_nals is None or sps is None or pps is None:
+        packed = generate_testsrc_bitstream(len(sei_nals), width=width, height=height, fps=fps)
+        if packed:
+            video_nals, sps, pps = packed
+    if video_nals is None or len(video_nals) < len(sei_nals):
+        # Last-resort tiny IDR — should not run on CI with ffmpeg installed
+        video_nals = [bytes([0x65, 0x88, 0x84, 0x00, 0x10])] * len(sei_nals)
+        sps = sps or bytes([0x67, 0x42, 0x00, 0x1E, 0xAB, 0x40, 0xF0, 0x28, 0xD3, 0x70])
+        pps = pps or bytes([0x68, 0xCE, 0x38, 0x80])
 
     mdat_payload = bytearray()
     sample_sizes: list[int] = []
-    for sei in sei_nals:
-        sample = struct.pack(">I", len(sei)) + sei + struct.pack(">I", len(dummy_idr)) + dummy_idr
+    for i, sei in enumerate(sei_nals):
+        vcl = video_nals[i]
+        sample = struct.pack(">I", len(sei)) + sei + struct.pack(">I", len(vcl)) + vcl
         sample_sizes.append(len(sample))
         mdat_payload.extend(sample)
 
@@ -125,12 +229,14 @@ def build_minimal_mp4_with_sei(
     dref = fullbox(b"dref", 0, 0, struct.pack(">I", 1) + url)
     dinf = box(b"dinf", dref)
 
-    sps = bytes([0x67, 0x42, 0x00, 0x1E, 0xAB, 0x40, 0xF0, 0x28, 0xD3, 0x70])
-    pps = bytes([0x68, 0xCE, 0x38, 0x80])
+    # avcC from real SPS/PPS (profile/compat/level from SPS bytes 1..3)
+    assert sps is not None and pps is not None
     avc_c = (
-        bytes([0x01, 0x42, 0x00, 0x1E, 0xFF, 0xE1, 0x00, len(sps)])
+        bytes([0x01, sps[1], sps[2], sps[3], 0xFF, 0xE1])
+        + struct.pack(">H", len(sps))
         + sps
-        + bytes([0x01, 0x00, len(pps)])
+        + bytes([0x01])
+        + struct.pack(">H", len(pps))
         + pps
     )
 
@@ -219,11 +325,20 @@ def main(argv: list[str] | None = None) -> None:
     args.out.mkdir(parents=True, exist_ok=True)
 
     nals = make_trajectory_samples(36, 12)
-    mp4 = build_minimal_mp4_with_sei(nals)
+    packed = generate_testsrc_bitstream(len(nals), width=320, height=240, fps=12)
+    if packed:
+        video_nals, sps, pps = packed
+        print(f"Using ffmpeg testsrc VCL NALs ({len(video_nals)} frames) with real SPS/PPS")
+        mp4 = build_minimal_mp4_with_sei(nals, video_nals=video_nals, sps=sps, pps=pps)
+        real = True
+    else:
+        print("WARNING: ffmpeg testsrc unavailable; using tiny fallback VCL NAL")
+        mp4 = build_minimal_mp4_with_sei(nals)
+        real = False
     for cam in ["front", "back", "left_repeater", "right_repeater"]:
         path = args.out / f"{args.timestamp}-{cam}.mp4"
         path.write_bytes(mp4)
-        print(f"Wrote {path} ({len(mp4)} bytes, {len(nals)} SEI NALs)")
+        print(f"Wrote {path} ({len(mp4)} bytes, {len(nals)} SEI NALs, real_video={real})")
 
     lat0, lon0 = 37.3947, -122.1503
     speed = 10.0

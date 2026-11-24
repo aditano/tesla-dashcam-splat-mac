@@ -203,36 +203,6 @@ def build_event(
             c2ws = [c2ws[i] for i in keep]
             cameras = [cameras[i] for i in keep]
 
-    # Per-camera color/exposure match to front (histogram/global stats; see color_match)
-    _emit(progress, "Matching per-camera color…", 0.18, stage="color")
-    reps: dict[str, Path] = {}
-    for cam in cameras:
-        cid = cam["camera"]
-        if cid not in reps:
-            reps[cid] = Path(cam["file_path"])
-    if reps:
-        affines = match_cameras_to_front(reps, out_dir / "color_matched")
-        (out_dir / "color_affines.json").write_text(json.dumps(affines, indent=2))
-        by_cam: dict[str, list[int]] = {}
-        for i, cam in enumerate(cameras):
-            by_cam.setdefault(cam["camera"], []).append(i)
-        for cid, idxs in by_cam.items():
-            aff = affines.get(cid)
-            if not aff or cid == "front":
-                continue
-            scale = np.array(aff["scale"], dtype=np.float64)
-            bias = np.array(aff["bias"], dtype=np.float64)
-            matched_dir = out_dir / "color_matched"
-            matched_dir.mkdir(parents=True, exist_ok=True)
-            for i in idxs:
-                p = Path(cameras[i]["file_path"])
-                img = np.asarray(Image.open(p).convert("RGB"))
-                matched = apply_affine(img, scale, bias)
-                dest = matched_dir / p.name
-                Image.fromarray(matched).save(dest, quality=92)
-                cameras[i]["file_path"] = str(dest)
-                images[i] = dest
-
     # --- ego 3D proxy (path-following GLB; fills masked ego region in viewer) ---
     _emit(progress, "Exporting ego vehicle path…", 0.20, stage="ego")
     ego_export = export_ego_sidecar(out_dir, traj.poses, dt=0.1)
@@ -258,7 +228,7 @@ def build_event(
         pidx = min(range(len(traj.poses)), key=lambda i: abs(traj.poses[i].time_sec - time_sec))
         return float(traj.poses[pidx].speed_mps)
 
-    # --- masks ---
+    # --- masks (before color match so stats ignore ego/sky/movers) ---
     t_stage = time.time()
     _emit(progress, "Building masks (ego/sky/movers)…", 0.25, stage="masks")
     check()
@@ -280,6 +250,45 @@ def build_event(
     )
     stage_devices["masks"] = mask_devices
     stage_t["masks_sec"] = time.time() - t_stage
+
+    # Per-camera color match AFTER masks; writes copies (never overwrites originals)
+    _emit(progress, "Matching per-camera color…", 0.28, stage="color")
+    reps: dict[str, Path] = {}
+    mask_reps: dict[str, Path] = {}
+    for cam in cameras:
+        cid = cam["camera"]
+        if cid not in reps:
+            reps[cid] = Path(cam["file_path"])
+            stem = Path(cam["file_name"]).stem
+            for ext in (".png", ".jpg"):
+                cand = masks_dir / f"{stem}{ext}"
+                if cand.exists():
+                    mask_reps[cid] = cand
+                    break
+    if reps:
+        affines = match_cameras_to_front(
+            reps, out_dir / "color_matched", masks=mask_reps or None
+        )
+        (out_dir / "color_affines.json").write_text(json.dumps(affines, indent=2))
+        by_cam: dict[str, list[int]] = {}
+        for i, cam in enumerate(cameras):
+            by_cam.setdefault(cam["camera"], []).append(i)
+        matched_dir = out_dir / "color_matched"
+        matched_dir.mkdir(parents=True, exist_ok=True)
+        for cid, idxs in by_cam.items():
+            aff = affines.get(cid)
+            if not aff or cid == "front":
+                continue
+            scale = np.array(aff["scale"], dtype=np.float64)
+            bias = np.array(aff["bias"], dtype=np.float64)
+            for i in idxs:
+                p = Path(cameras[i]["file_path"])
+                img = np.asarray(Image.open(p).convert("RGB"))
+                matched = apply_affine(img, scale, bias)
+                dest = matched_dir / Path(cameras[i]["file_name"]).name
+                Image.fromarray(matched).save(dest, quality=92)
+                cameras[i]["file_path"] = str(dest)
+                images[i] = dest
 
     # --- MapAnything ---
     t_stage = time.time()
