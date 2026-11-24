@@ -34,7 +34,8 @@ from dashsplat.mapanything import (
     voxel_downsample,
 )
 from dashsplat.masks.pipeline import build_masks_for_frames
-from dashsplat.sei import extract_sei_from_mp4
+from dashsplat.export import merge_gaussian_plies, write_gaussian_ply
+from dashsplat.sei import extract_sei_from_event
 from dashsplat.tiers import QualityTier, budget_for
 from dashsplat.tiles import split_route_tiles
 from dashsplat.timing_offsets import DEFAULT_OFFSETS_SEC, save_offsets
@@ -126,15 +127,8 @@ def build_event(
     t_stage = time.time()
     _emit(progress, f"Parsing SEI for {event.id}…", 0.05, stage="ingest", eta_sec=budget.eta_prior_sec)
     check()
-    samples = []
-    for seg in event.segments:
-        for cam, path in seg.cameras.items():
-            if cam == "front" or not samples:
-                samples = extract_sei_from_mp4(path)
-                if samples:
-                    break
-        if samples:
-            break
+    # SEI from every clip, stitched onto the event timeline (not just minute 1)
+    samples = extract_sei_from_event(event)
     traj = build_trajectory_from_sei(samples)
     (out_dir / "trajectory.json").write_text(
         json.dumps(
@@ -182,7 +176,8 @@ def build_event(
     if not images:
         return {"ok": False, "exit_code": 3, "error": "no frames extracted", "event_id": event.id}
 
-    # Distance-based keyframe indices — filter extracted frames to those poses
+    # Distance-based keyframe times — keep frames near those times (tolerance),
+    # not only when the nearest pose index is exactly a keyframe index.
     key_idx = select_keyframes(
         traj.poses,
         cameras=event.cameras or ["front"],
@@ -190,12 +185,27 @@ def build_event(
     )
     (out_dir / "keyframes.json").write_text(json.dumps(key_idx, indent=2))
     if traj.poses and any(key_idx.values()):
+        key_times_by_cam: dict[str, list[float]] = {}
+        all_key_times: list[float] = []
+        for cam_name, idxs in key_idx.items():
+            times = [float(traj.poses[i].time_sec) for i in idxs if 0 <= i < len(traj.poses)]
+            key_times_by_cam[cam_name] = times
+            all_key_times.extend(times)
+        # Tolerance: half the median keyframe spacing (fallback 0.75s)
+        tol = 0.75
+        if len(all_key_times) >= 2:
+            sorted_t = sorted(all_key_times)
+            gaps = [sorted_t[i + 1] - sorted_t[i] for i in range(len(sorted_t) - 1)]
+            gaps = [g for g in gaps if g > 1e-3]
+            if gaps:
+                gaps_sorted = sorted(gaps)
+                med = gaps_sorted[len(gaps_sorted) // 2]
+                tol = max(0.25, med * 0.5)
         keep: list[int] = []
         for i, cam in enumerate(cameras):
             t = float(cam.get("time_sec", 0.0))
-            pidx = min(range(len(traj.poses)), key=lambda j: abs(traj.poses[j].time_sec - t))
-            allowed = key_idx.get(cam["camera"]) or key_idx.get("front") or []
-            if not allowed or pidx in allowed:
+            times = key_times_by_cam.get(cam["camera"]) or key_times_by_cam.get("front") or all_key_times
+            if not times or min(abs(t - kt) for kt in times) <= tol:
                 keep.append(i)
         if keep:
             images = [images[i] for i in keep]
@@ -253,12 +263,12 @@ def build_event(
 
     # Per-camera color match AFTER masks; writes copies (never overwrites originals)
     _emit(progress, "Matching per-camera color…", 0.28, stage="color")
-    reps: dict[str, Path] = {}
+    reps: dict[str, list[Path]] = {}
     mask_reps: dict[str, Path] = {}
     for cam in cameras:
         cid = cam["camera"]
-        if cid not in reps:
-            reps[cid] = Path(cam["file_path"])
+        reps.setdefault(cid, []).append(Path(cam["file_path"]))
+        if cid not in mask_reps:
             stem = Path(cam["file_name"]).stem
             for ext in (".png", ".jpg"):
                 cand = masks_dir / f"{stem}{ext}"
@@ -319,6 +329,17 @@ def build_event(
         pointmap = synthetic_pointmap_from_poses(images, c2ws, Ks, progress=progress)
         geom_device = "synthetic_cpu"
     stage_devices["geometry"] = geom_device
+    geom_warning = None
+    if pointmap.get("backend") in ("synthetic-fallback", "synthetic_cpu") or geom_device == "synthetic_cpu":
+        geom_warning = (
+            "MapAnything unavailable — using synthetic flat-plane geometry fallback. "
+            "Splat quality will be low until MLX MapAnything weights load."
+        )
+        stage_devices["geometry_warning"] = geom_warning
+        _emit(progress, geom_warning, 0.45, stage="geometry")
+    if decode_report.get("placeholder_used") and decode_report.get("warning"):
+        stage_devices["decode_warning"] = decode_report["warning"]
+        _emit(progress, decode_report["warning"], 0.15, stage="keyframes")
     save_pointmap_npz(out_dir / "pointmap.npz", pointmap)
     means, colors = pointmap_to_cloud(pointmap, max_points=250_000)
     means, colors = voxel_downsample(
@@ -375,6 +396,7 @@ def build_event(
     use_tiles = budget.name == QualityTier.FULL and len(tiles) > 1
     if use_tiles:
         tile_results = []
+        tile_plys: list[Path] = []
         all_means = []
         all_colors = []
         for tile in tiles:
@@ -404,20 +426,28 @@ def build_event(
             tile_results.append(tr)
             all_means.append(t_means)
             all_colors.append(t_colors)
-        # Prefer last non-seeded Metal tile; else merge means for a seeded export
-        metal = [r for r in tile_results if r.get("trainer") != "seeded"]
-        if metal:
-            train_result = metal[-1]
-            # Copy winning PLY to out_dir root for the app
-            src_ply = Path(train_result["ply"]) if train_result.get("ply") else None
-            if src_ply and src_ply.exists():
-                dest = out_dir / "splat.ply"
-                if src_ply.resolve() != dest.resolve():
-                    dest.write_bytes(src_ply.read_bytes())
-                train_result = {**train_result, "ply": str(dest)}
+            if tr.get("ply") and Path(tr["ply"]).exists():
+                tile_plys.append(Path(tr["ply"]))
+        # Merge ALL tile outputs into one world-frame PLY (do not keep only the last tile)
+        dest = out_dir / "splat.ply"
+        if tile_plys:
+            merge_gaussian_plies(tile_plys, dest, voxel_m=0.05, max_points=splat_cap)
+            trainers_used = [r.get("trainer") for r in tile_results]
+            train_result = {
+                "trainer": trainers_used[-1],
+                "ply": str(dest),
+                "spz": None,
+                "cameras": str(out_dir / "cameras.json"),
+                "exit_code": 0,
+                "num_gaussians": None,
+                "n_tiles_trained": len(tile_results),
+                "tile_trainers": trainers_used,
+                "cpu_fallback": all(t == "seeded" for t in trainers_used),
+            }
         else:
             merged_m = np.concatenate(all_means, axis=0) if all_means else means
             merged_c = np.concatenate(all_colors, axis=0) if all_colors else colors
+            write_gaussian_ply(dest, merged_m, merged_c)
             train_result = train_splat(
                 merged_m,
                 merged_c,
@@ -491,7 +521,13 @@ def build_event(
         "masks": str(masks_dir),
         "num_gaussians": train_result.get("num_gaussians") or int(means.shape[0]),
         "n_tiles": len(tiles),
-        "warning": train_warning or traj.warning or health.message,
+        "warning": train_warning
+        or geom_warning
+        or decode_report.get("warning")
+        or traj.warning
+        or health.message,
+        "pointmap_synthetic": bool(geom_warning),
+        "placeholder_frames": bool(decode_report.get("placeholder_used")),
         "has_sei": health.has_sei,
         "eta_prior_sec": budget.eta_prior_sec,
         "hw_generation": hw.generation.value,

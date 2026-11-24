@@ -288,19 +288,26 @@ def build_minimal_mp4_with_sei(
     return ftyp + moov + mdat
 
 
-def make_trajectory_samples(n: int = 36, fps: int = 12) -> list[bytes]:
-    lat0, lon0 = 37.3947, -122.1503
-    speed = 10.0
-    heading = 90.0
+def make_trajectory_samples(
+    n: int = 36,
+    fps: int = 12,
+    *,
+    start_east_m: float = 0.0,
+    start_seq: int = 0,
+    speed: float = 10.0,
+    heading: float = 90.0,
+    lat0: float = 37.3947,
+    lon0: float = -122.1503,
+) -> list[bytes]:
     nals: list[bytes] = []
     for i in range(n):
         t = i / fps
-        meters_east = speed * t
+        meters_east = start_east_m + speed * t
         lon = lon0 + meters_east / (111320 * math.cos(math.radians(lat0)))
         proto = encode_sei_metadata(
             version=1,
             gear_state=1,
-            frame_seq_no=i,
+            frame_seq_no=start_seq + i,
             speed_mps=speed,
             lat=lat0,
             lon=lon,
