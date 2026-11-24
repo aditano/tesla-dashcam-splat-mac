@@ -198,8 +198,9 @@
       const yaw = sample.yaw_rad;
       // Rotate mesh +Z → world forward: angle around Y so local Z maps to (cos,0,-sin)
       // R_y(θ): x'=x cos + z sin, z'=-x sin + z cos. For local (0,0,1) → (sin θ, 0, cos θ).
-      // Want (cos yaw, 0, -sin yaw) ⇒ sin θ = cos yaw, cos θ = -sin yaw ⇒ θ = π/2 - yaw
-      const th = Math.PI / 2 - yaw;
+      // Want (cos yaw, 0, -sin yaw) ⇒ sin θ = cos yaw, cos θ = -sin yaw ⇒ θ = π/2 + yaw
+      // (π/2 − yaw faced the ego car backwards)
+      const th = Math.PI / 2 + yaw;
       const c = Math.cos(th), s = Math.sin(th);
       const p = sample.position_y_up || enuToYUp(sample.position[0], sample.position[1], sample.position[2] || 0);
       // Column-major

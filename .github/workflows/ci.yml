@@ -21,12 +21,12 @@ jobs:
         run: |
           python3 -m pip install -U pip
           python3 -m pip install -e "python/[dev]"
-      - name: Generate synthetic fixtures
+      - name: Generate synthetic fixtures (temp — never overwrite tracked fixtures/)
         run: |
-          python3 python/tools/generate_synthetic_clip.py --out fixtures/synthetic
-          mkdir -p fixtures/sample_teslacam/SavedClips/2025-11-20_14-03-12
-          cp fixtures/synthetic/*.mp4 fixtures/sample_teslacam/SavedClips/2025-11-20_14-03-12/
-          echo '{"city":"Palo Alto","est_lat":37.3947,"est_lon":-122.1503}' > fixtures/sample_teslacam/SavedClips/2025-11-20_14-03-12/event.json
+          SYNTH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dashsplat-synth.XXXXXX")"
+          echo "SYNTH_DIR=$SYNTH_DIR" >> "$GITHUB_ENV"
+          python3 python/tools/generate_synthetic_clip.py --out "$SYNTH_DIR"
+          # Tracked fixtures/sample_teslacam is used as-is; do not cp over it.
       - name: Pytest
         working-directory: python
         run: |
@@ -53,10 +53,11 @@ jobs:
           echo "doctor_exit_code=$dcode"
           python3 -m dashsplat.cli doctor > doctor.json
           EID=$(python3 -m dashsplat.cli list fixtures/sample_teslacam --json | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['id'])")
-          python3 -m dashsplat.cli bench fixtures/sample_teslacam --event "$EID" --trainer seeded --no-mlx --out /tmp/dashsplat-bench | tee bench_out.jsonl
+          BENCH_OUT="$(mktemp -d "${TMPDIR:-/tmp}/dashsplat-bench.XXXXXX")"
+          python3 -m dashsplat.cli bench fixtures/sample_teslacam --event "$EID" --trainer seeded --no-mlx --out "$BENCH_OUT" | tee bench_out.jsonl
           bcode=${PIPESTATUS[0]}
           echo "bench_exit_code=$bcode"
-          test -f /tmp/dashsplat-bench/bench.json && cat /tmp/dashsplat-bench/bench.json
+          test -f "$BENCH_OUT/bench.json" && cat "$BENCH_OUT/bench.json"
           if [[ $dcode -ne 0 ]]; then exit $dcode; fi
           exit $bcode
       - name: Upload doctor/bench artifacts
@@ -67,7 +68,7 @@ jobs:
           path: |
             doctor.txt
             doctor.json
-            /tmp/dashsplat-bench/bench.json
+            bench_out.jsonl
           if-no-files-found: warn
 
   macos-app:
@@ -117,13 +118,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Prep fixtures + python
+      - name: Prep python (tracked fixtures only — do not overwrite fixtures/)
         run: |
           python3 -m pip install -e "python/[dev]"
-          python3 python/tools/generate_synthetic_clip.py --out fixtures/synthetic
-          mkdir -p fixtures/sample_teslacam/SavedClips/2025-11-20_14-03-12
-          cp fixtures/synthetic/*.mp4 fixtures/sample_teslacam/SavedClips/2025-11-20_14-03-12/
-          echo '{"city":"Palo Alto","est_lat":37.3947,"est_lon":-122.1503}' > fixtures/sample_teslacam/SavedClips/2025-11-20_14-03-12/event.json
+          SYNTH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dashsplat-synth.XXXXXX")"
+          python3 python/tools/generate_synthetic_clip.py --out "$SYNTH_DIR"
       - name: XcodeGen + test
         env:
           DASHSPLAT_PYTHON_DIR: ${{ github.workspace }}/python

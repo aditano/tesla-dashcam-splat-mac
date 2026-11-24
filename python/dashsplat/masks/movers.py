@@ -40,13 +40,11 @@ def mover_mask_ego_motion(
     h, w = img.shape
     keep = np.ones((h, w), dtype=np.uint8) * 255
     # Raw frame differencing while driving blanks the static scene (ego-motion
-    # looks like "everything moved"). Without ego-motion compensation, only
-    # attempt differencing when nearly stopped; never when speed > threshold.
-    _ = prev_image_path, protect_vegetation, erode_px
-    if abs(speed_mps) > 0.5:
-        return keep
-    # Parked / crawl: also skip raw differencing (parked cars must stay in scene).
-    # RF-DETR path handles movers when available; this heuristic is a no-op.
+    # looks like "everything moved"). Without ego-motion compensation we never
+    # apply this heuristic — leave disabled while driving AND when parked
+    # (parked cars must stay). RF-DETR path handles movers when available.
+    # Callers should surface a result warning that mover masking is disabled.
+    _ = prev_image_path, protect_vegetation, erode_px, speed_mps
     return keep
 
 
